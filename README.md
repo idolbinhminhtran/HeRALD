@@ -25,7 +25,7 @@ HGAT-LDA/
 - Python 3.8–3.11
 - CUDA-capable GPU optional (CPU supported; GPU recommended)
 
-Install dependencies:
+Install dependencies
 ```bash
 pip install -r requirements.txt
 ```
