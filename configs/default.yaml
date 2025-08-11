@@ -1,0 +1,42 @@
+# Optimized configuration for HGAT-LDA with improved hyperparameters
+
+model:
+  emb_dim: 256               # Increased embedding dimension for better representation
+  num_layers: 5               # Deeper network for complex patterns
+  dropout: 0.2                # Reduced dropout to retain more information
+  num_heads: 12               # More attention heads for richer representations
+  relation_dropout: 0.05      # Light relation dropout for regularization
+  use_layernorm: true         # Use LayerNorm for stable training
+  use_residual: true          # Use residual connections
+
+training:
+  lr: 5e-4                    # Optimized learning rate
+  weight_decay: 5e-6          # Light weight decay
+  batch_size: 256             # Smaller batch for better gradients
+  num_epochs: 150             # More epochs with early stopping
+  val_split: 0.15             # Slightly larger validation set
+  early_stopping_patience: 25 # More patience for convergence
+  neg_ratio: 5                # More negatives for better discrimination
+  cosine_tmax: 150            # Use cosine annealing matching epochs
+  use_focal_loss: true        # Use focal loss for imbalance
+  label_smoothing: 0.1        # Label smoothing for regularization
+  gradient_clip: 2.0          # Gradient clipping for stability
+
+evaluation:
+  loocv_epochs: 20            # More epochs for LOOCV
+  loocv_batch_size: 256       # Batch size for LOOCV  
+  loocv_lr: 3e-4              # Lower LR for LOOCV
+  loocv_neg_ratio: 3          # Negative ratio for LOOCV
+
+data:
+  threshold: 0.0
+  symmetric: true
+  data_dir: Dataset
+  sim_row_normalize: true     # Normalize similarity matrices
+  sim_topk: 30                # Keep top-30 neighbors (sweet spot)
+
+system:
+  device: auto                # Device: auto, cuda, cpu
+  seed: 42                    # Random seed
+  num_workers: 4              # Number of data loading workers
+  use_amp: true               # Use automatic mixed precision

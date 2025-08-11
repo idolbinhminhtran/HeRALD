@@ -1,0 +1,59 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Python cache/build
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.build/
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.hypothesis/
+.ipynb_checkpoints/
+
+# Environments
+.env
+.venv
+venv/
+env/
+ENV/
+.env.*
+
+# Editors/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Project data and large artifacts
+Dataset/**
+!Dataset/README.md
+results/**
+evaluation_results/**
+*.pth
+*.pt
+*.onnx
+*.bin
+*.ckpt
+
+# Plots/exports
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
