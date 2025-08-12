@@ -112,7 +112,11 @@ class HGATLDAEvaluator:
                                      num_epochs: int = 30,
                                      batch_size: int = 256,
                                      lr: float = 1e-3,
-                                     neg_ratio: int = 1) -> List[float]:
+                                     neg_ratio: int = 1,
+                                     weight_decay: float = 1e-5,
+                                     use_focal_loss: bool = True,
+                                     label_smoothing: float = 0.1,
+                                     cosine_tmax: Optional[int] = None) -> List[float]:
         """
         Perform Leave-One-Out Cross-Validation with multi-GPU optimization.
         
@@ -151,7 +155,7 @@ class HGATLDAEvaluator:
             # Remove test pair from training data
             train_pos_pairs = torch.cat([pos_pairs[:fold_idx], pos_pairs[fold_idx+1:]], dim=0)
             
-            # Create a fresh model for this fold
+            # Create a fresh model for this fold using same architecture
             model_fold = HGAT_LDA(
                 num_lncRNAs=num_lncRNAs,
                 num_genes=self.model.gene_embed.num_embeddings,
@@ -159,21 +163,26 @@ class HGATLDAEvaluator:
                 edges=edges,
                 emb_dim=self.model.emb_dim,
                 num_layers=self.model.num_layers,
-                dropout=self.model.dropout
+                dropout=self.model.dropout,
+                num_heads=self.model.num_heads if hasattr(self.model, 'num_heads') else 4,
+                relation_dropout=self.model.relation_dropout if hasattr(self.model, 'relation_dropout') else 0.1,
+                use_layernorm=self.model.use_layernorm if hasattr(self.model, 'use_layernorm') else True,
+                use_residual=self.model.use_residual if hasattr(self.model, 'use_residual') else True
             ).to(self.device)
             
-            # Create trainer with optimized settings for multi-GPU
+            # Create trainer using parameters from config
             trainer = HGATLDATrainer(
                 model=model_fold,
                 device=self.device,
                 lr=float(lr),
+                weight_decay=float(weight_decay),
                 batch_size=int(batch_size),
                 enable_progress=False,
                 neg_ratio=int(neg_ratio),
                 use_amp=torch.cuda.is_available(),  # Enable AMP for RTX 5090
-                use_focal_loss=True,  # Use focal loss for better performance
-                label_smoothing=0.05,  # Light label smoothing for LOOCV
-                cosine_tmax=num_epochs,  # Use cosine annealing
+                use_focal_loss=use_focal_loss,  # Use focal loss from config
+                label_smoothing=label_smoothing,  # Use label smoothing from config
+                cosine_tmax=cosine_tmax if cosine_tmax else num_epochs,  # Use cosine annealing from config
                 use_multi_gpu=True  # Enable multi-GPU for each fold
             )
             

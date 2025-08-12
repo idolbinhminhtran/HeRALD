@@ -190,11 +190,13 @@ def run_loocv(config: Dict[str, Any], dataset_info: Dict, edges: Dict, pos_pairs
         print(f"🚀 Detected {n_gpus} GPUs - Optimizing for parallel execution")
         print(f"   - DataParallel will automatically distribute batches across GPUs")
     
-    print(f"📊 Configuration:")
-    print(f"   - LOOCV epochs: {config['evaluation']['loocv_epochs']}")
-    print(f"   - LOOCV batch size: {config['evaluation']['loocv_batch_size']}")
-    print(f"   - LOOCV learning rate: {config['evaluation']['loocv_lr']}")
-    print(f"   - LOOCV negative ratio: {config['evaluation']['loocv_neg_ratio']}")
+    print(f"📊 Configuration (using main training parameters):")
+    print(f"   - Epochs: {config['training']['num_epochs']}")
+    print(f"   - Batch size: {config['training']['batch_size']}")
+    print(f"   - Learning rate: {config['training']['lr']}")
+    print(f"   - Negative ratio: {config['training']['neg_ratio']}")
+    print(f"   - Focal loss: {config['training'].get('use_focal_loss', True)}")
+    print(f"   - Label smoothing: {config['training'].get('label_smoothing', 0.1)}")
     print(f"   - Device: {device} (GPUs available: {n_gpus})")
     
     # Create model (will be recreated for each fold)
@@ -215,16 +217,20 @@ def run_loocv(config: Dict[str, Any], dataset_info: Dict, edges: Dict, pos_pairs
     # Create evaluator
     evaluator = HGATLDAEvaluator(model, device)
     
-    # Run LOOCV
+    # Run LOOCV using main training parameters from config
     auc_scores = evaluator.leave_one_out_cross_validation(
         pos_pairs=pos_pairs,
         edges=edges,
         num_lncRNAs=dataset_info['num_lncRNAs'],
         num_diseases=dataset_info['num_diseases'],
-        num_epochs=config['evaluation']['loocv_epochs'],
-        batch_size=config['evaluation']['loocv_batch_size'],
-        lr=config['evaluation']['loocv_lr'],
-        neg_ratio=config['evaluation']['loocv_neg_ratio']
+        num_epochs=config['training']['num_epochs'],  # Use main training epochs
+        batch_size=config['training']['batch_size'],  # Use main training batch size
+        lr=config['training']['lr'],  # Use main training learning rate
+        neg_ratio=config['training']['neg_ratio'],  # Use main training neg_ratio
+        weight_decay=config['training'].get('weight_decay', 1e-5),  # Pass weight decay
+        use_focal_loss=config['training'].get('use_focal_loss', True),  # Pass focal loss
+        label_smoothing=config['training'].get('label_smoothing', 0.1),  # Pass label smoothing
+        cosine_tmax=config['training'].get('cosine_tmax', None)  # Pass cosine annealing
     )
     
     # Calculate statistics

@@ -1,5 +1,3 @@
-# Optimized configuration for 4x RTX 5090 + 64-core CPU server
-
 model:
   emb_dim: 256               # Increased embedding dimension for better representation
   num_layers: 5               # Deeper network for complex patterns
@@ -10,23 +8,20 @@ model:
   use_residual: true          # Use residual connections
 
 training:
-  lr: 5e-4                    # Optimized learning rate
-  weight_decay: 5e-6          # Light weight decay
-  batch_size: 256             # Smaller batch for better gradients
-  num_epochs: 150             # More epochs with early stopping
-  val_split: 0.15             # Slightly larger validation set
-  early_stopping_patience: 25 # More patience for convergence
-  neg_ratio: 5                # More negatives for better discrimination
-  cosine_tmax: 150            # Use cosine annealing matching epochs
-  use_focal_loss: true        # Use focal loss for imbalance
-  label_smoothing: 0.1        # Label smoothing for regularization
-  gradient_clip: 2.0          # Gradient clipping for stability
+  lr: 3e-4                    # Optimized learning rate (used for both training and LOOCV)
+  weight_decay: 1e-5          # Moderate weight decay
+  batch_size: 1024            # Large batch for RTX 5090 (used for both training and LOOCV)
+  num_epochs: 30              # Epochs for both training and LOOCV
+  val_split: 0.15             # Standard validation split
+  early_stopping_patience: 10 # Reasonable patience
+  neg_ratio: 5                # Good negative sampling
+  cosine_tmax: 30             # Match epochs for cosine annealing
+  use_focal_loss: true        # Handle class imbalance
+  label_smoothing: 0.1        # Regularization
+  gradient_clip: 1.0          # Gradient clipping for stability
 
-evaluation:
-  loocv_epochs: 20            # More epochs for LOOCV
-  loocv_batch_size: 256       # Batch size for LOOCV  
-  loocv_lr: 3e-4              # Lower LR for LOOCV
-  loocv_neg_ratio: 3          # Negative ratio for LOOCV
+# Note: LOOCV now uses the same parameters from 'training' section above
+# This ensures consistency between training and evaluation
 
 data:
   threshold: 0.0
@@ -38,5 +33,7 @@ data:
 system:
   device: auto                # Device: auto, cuda, cpu
   seed: 42                    # Random seed
-  num_workers: 4              # Number of data loading workers
-  use_amp: true   
+  num_workers: 32             # Many workers for 64-core CPU
+  use_amp: true               # Enable AMP for RTX 5090
+  pin_memory: true            # Pin memory for faster GPU transfer
+  prefetch_factor: 4          # Prefetch batches for efficiency
