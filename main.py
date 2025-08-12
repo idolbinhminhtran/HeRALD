@@ -188,9 +188,7 @@ def run_loocv(config: Dict[str, Any], dataset_info: Dict, edges: Dict, pos_pairs
     n_gpus = torch.cuda.device_count()
     if n_gpus > 1:
         print(f"🚀 Detected {n_gpus} GPUs - Optimizing for parallel execution")
-        # Scale batch size for multi-GPU efficiency
-        config['evaluation']['loocv_batch_size'] = min(2048, config['evaluation']['loocv_batch_size'] * n_gpus)
-        print(f"   - Using {n_gpus} GPUs for accelerated training")
+        print(f"   - DataParallel will automatically distribute batches across GPUs")
     
     print(f"📊 Configuration:")
     print(f"   - LOOCV epochs: {config['evaluation']['loocv_epochs']}")

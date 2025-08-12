@@ -73,14 +73,12 @@ class HGATLDATrainer:
         
         # Enable multi-GPU if available and requested
         self.use_multi_gpu = use_multi_gpu
+        self.batch_size = batch_size
         if use_multi_gpu and torch.cuda.device_count() > 1:
             print(f"🚀 Using DataParallel with {torch.cuda.device_count()} GPUs")
             self.model = nn.DataParallel(self.model)
-            # Scale batch size for multi-GPU
-            self.batch_size = batch_size * torch.cuda.device_count()
-            print(f"   Scaled batch size: {self.batch_size}")
-        else:
-            self.batch_size = batch_size
+            # DataParallel automatically splits batch across GPUs
+            print(f"   Batch size: {self.batch_size} total ({self.batch_size // torch.cuda.device_count()} per GPU)")
         self.enable_progress = enable_progress
         self.neg_ratio = max(1, neg_ratio)
         self.use_amp = use_amp and torch.cuda.is_available()

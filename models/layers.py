@@ -92,7 +92,8 @@ class HeterogeneousGNNLayer(nn.Module):
         # Initialize output embeddings
         new_h = {t: torch.zeros_like(h) for t, h in h_dict.items()}
         rel_message_dict = {}
-        device = next(self.parameters()).device
+        # Get device from input tensors instead of parameters (works with DataParallel)
+        device = next(iter(h_dict.values())).device
         
         # Neighbor aggregation for each relation type
         for (src_type, rel_name, dst_type), (src_idx, dst_idx, w) in edges.items():
