@@ -1,23 +1,23 @@
 model:
-  emb_dim: 512               # Increased embedding dimension for better representation
-  num_layers: 5               # Deeper network for complex patterns
-  dropout: 0.2                # Reduced dropout to retain more information
-  num_heads: 16              # More attention heads for richer representations
-  relation_dropout: 0.05      # Light relation dropout for regularization
-  use_layernorm: true         # Use LayerNorm for stable training
-  use_residual: true          # Use residual connections
+  emb_dim: 256               # Updated per tuning
+  num_layers: 4              # Updated per tuning
+  dropout: 0.35              # Updated per tuning
+  num_heads: 6               # Updated per tuning
+  relation_dropout: 0.1      # Updated per tuning
+  use_layernorm: true        # Use LayerNorm for stable training
+  use_residual: true         # Use residual connections
 
 training:
-  lr: 5e-4                    # Optimized learning rate (used for both training and LOOCV)
-  weight_decay: 1e-5          # Moderate weight decay
-  batch_size: 2048            # Large batch for RTX 5090 (used for both training and LOOCV)
-  num_epochs: 50              # Epochs for both training and LOOCV
+  lr: 0.0003762875402329099  # Updated per tuning
+  weight_decay: 7.438974554514027e-05  # Updated per tuning
+  batch_size: 128             # Updated per tuning
+  num_epochs: 50              # Keep as is unless tuned separately
   val_split: 0.15             # Standard validation split
   early_stopping_patience: 10 # Reasonable patience
-  neg_ratio: 5                # Good negative sampling
-  cosine_tmax: 30             # Match epochs for cosine annealing
-  use_focal_loss: true        # Handle class imbalance
-  label_smoothing: 0.1        # Regularization
+  neg_ratio: 3                # Updated per tuning
+  cosine_tmax: 50             # Updated per tuning
+  use_focal_loss: false       # Updated per tuning
+  label_smoothing: 0.05       # Updated per tuning
   gradient_clip: 1.0          # Gradient clipping for stability
 
 
