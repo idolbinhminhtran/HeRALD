@@ -63,8 +63,13 @@ def load_data_and_graph(config: Dict[str, Any]):
 
 
 def run_training(config: Dict[str, Any], dataset_info: Dict, edges: Dict, pos_pairs: torch.Tensor, device: torch.device, results_path: str):
-    """Run training mode."""
+    """Run training mode with multi-GPU support."""
     print("\n🚀 Starting training...")
+    
+    # Check for multi-GPU availability
+    n_gpus = torch.cuda.device_count()
+    if n_gpus > 1:
+        print(f"🌐 Detected {n_gpus} GPUs - enabling DataParallel multi-GPU training")
     
     # Create model
     model = HGAT_LDA(
@@ -81,7 +86,7 @@ def run_training(config: Dict[str, Any], dataset_info: Dict, edges: Dict, pos_pa
         use_residual=config['model'].get('use_residual', True)
     ).to(device)
     
-    # Create trainer
+    # Create trainer with multi-GPU support
     trainer = HGATLDATrainer(
         model=model,
         device=device,
@@ -89,7 +94,8 @@ def run_training(config: Dict[str, Any], dataset_info: Dict, edges: Dict, pos_pa
         batch_size=int(config['training']['batch_size']),
         neg_ratio=int(config['training']['neg_ratio']),
         use_focal_loss=config['training'].get('use_focal_loss', False),
-        label_smoothing=config['training'].get('label_smoothing', 0.0)
+        label_smoothing=config['training'].get('label_smoothing', 0.0),
+        use_multi_gpu=True  # Enable multi-GPU by default
     )
     
     # Generate negative pairs
@@ -175,13 +181,23 @@ def run_evaluation(config: Dict[str, Any], dataset_info: Dict, edges: Dict, pos_
 
 
 def run_loocv(config: Dict[str, Any], dataset_info: Dict, edges: Dict, pos_pairs: torch.Tensor, device: torch.device, results_path: str):
-    """Run LOOCV mode."""
+    """Run LOOCV mode with multi-GPU optimization."""
     print("\n🔄 Starting LOOCV...")
+    
+    # Detect and optimize for available GPUs
+    n_gpus = torch.cuda.device_count()
+    if n_gpus > 1:
+        print(f"🚀 Detected {n_gpus} GPUs - Optimizing for parallel execution")
+        # Scale batch size for multi-GPU efficiency
+        config['evaluation']['loocv_batch_size'] = min(2048, config['evaluation']['loocv_batch_size'] * n_gpus)
+        print(f"   - Using {n_gpus} GPUs for accelerated training")
+    
     print(f"📊 Configuration:")
     print(f"   - LOOCV epochs: {config['evaluation']['loocv_epochs']}")
     print(f"   - LOOCV batch size: {config['evaluation']['loocv_batch_size']}")
     print(f"   - LOOCV learning rate: {config['evaluation']['loocv_lr']}")
     print(f"   - LOOCV negative ratio: {config['evaluation']['loocv_neg_ratio']}")
+    print(f"   - Device: {device} (GPUs available: {n_gpus})")
     
     # Create model (will be recreated for each fold)
     model = HGAT_LDA(

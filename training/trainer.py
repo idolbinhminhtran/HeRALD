@@ -36,7 +36,7 @@ class FocalLoss(nn.Module):
 
 class HGATLDATrainer:
     """
-    Trainer class for HGAT-LDA model.
+    Trainer class for HGAT-LDA model with multi-GPU support.
     """
     
     def __init__(self, 
@@ -50,9 +50,10 @@ class HGATLDATrainer:
                  cosine_tmax: Optional[int] = None,
                  use_amp: bool = True,
                  use_focal_loss: bool = True,
-                 label_smoothing: float = 0.1):
+                 label_smoothing: float = 0.1,
+                 use_multi_gpu: bool = True):
         """
-        Initialize the trainer.
+        Initialize the trainer with optional multi-GPU support.
         
         Args:
             model: HGAT-LDA model
@@ -64,10 +65,22 @@ class HGATLDATrainer:
             neg_ratio: Number of negatives per positive in a batch
             cosine_tmax: If provided, use CosineAnnealingLR with T_max
             use_amp: Whether to use automatic mixed precision (AMP) for training
+            use_multi_gpu: Whether to use DataParallel for multi-GPU training
         """
+        # Move model to device first
         self.model = model.to(device)
         self.device = device
-        self.batch_size = batch_size
+        
+        # Enable multi-GPU if available and requested
+        self.use_multi_gpu = use_multi_gpu
+        if use_multi_gpu and torch.cuda.device_count() > 1:
+            print(f"🚀 Using DataParallel with {torch.cuda.device_count()} GPUs")
+            self.model = nn.DataParallel(self.model)
+            # Scale batch size for multi-GPU
+            self.batch_size = batch_size * torch.cuda.device_count()
+            print(f"   Scaled batch size: {self.batch_size}")
+        else:
+            self.batch_size = batch_size
         self.enable_progress = enable_progress
         self.neg_ratio = max(1, neg_ratio)
         self.use_amp = use_amp and torch.cuda.is_available()

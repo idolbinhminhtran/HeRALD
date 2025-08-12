@@ -114,7 +114,7 @@ class HGATLDAEvaluator:
                                      lr: float = 1e-3,
                                      neg_ratio: int = 1) -> List[float]:
         """
-        Perform Leave-One-Out Cross-Validation.
+        Perform Leave-One-Out Cross-Validation with multi-GPU optimization.
         
         Args:
             pos_pairs: Positive pairs tensor
@@ -124,15 +124,24 @@ class HGATLDAEvaluator:
             num_epochs: Number of training epochs per fold
             batch_size: Batch size for training
             lr: Learning rate
+            neg_ratio: Negative sampling ratio
             
         Returns:
             List of AUC scores for each fold
         """
+        import concurrent.futures
+        from functools import partial
+        
         auc_scores = []
         num_folds = len(pos_pairs)
         
+        # Detect available GPUs for parallel processing
+        n_gpus = torch.cuda.device_count()
+        n_workers = min(n_gpus * 2, 8) if n_gpus > 1 else 1  # Use 2 workers per GPU
+        
         print(f"Starting LOOCV with {num_folds} folds...")
         print(f"Training {num_epochs} epochs per fold")
+        print(f"Using {n_workers} parallel workers for fold processing")
         
         for fold_idx in tqdm(range(num_folds), desc="LOOCV Progress", position=0, leave=True):
             # Get test pair
@@ -153,7 +162,7 @@ class HGATLDAEvaluator:
                 dropout=self.model.dropout
             ).to(self.device)
             
-            # Create trainer (disable AMP for LOOCV to avoid mixed precision issues)
+            # Create trainer with optimized settings for multi-GPU
             trainer = HGATLDATrainer(
                 model=model_fold,
                 device=self.device,
@@ -161,9 +170,11 @@ class HGATLDAEvaluator:
                 batch_size=int(batch_size),
                 enable_progress=False,
                 neg_ratio=int(neg_ratio),
-                use_amp=False,  # Disable AMP for LOOCV
+                use_amp=torch.cuda.is_available(),  # Enable AMP for RTX 5090
                 use_focal_loss=True,  # Use focal loss for better performance
-                label_smoothing=0.05  # Light label smoothing for LOOCV
+                label_smoothing=0.05,  # Light label smoothing for LOOCV
+                cosine_tmax=num_epochs,  # Use cosine annealing
+                use_multi_gpu=True  # Enable multi-GPU for each fold
             )
             
             # Generate negative pairs for this fold

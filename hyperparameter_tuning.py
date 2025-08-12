@@ -79,7 +79,7 @@ def quick_evaluate(config: Dict[str, Any],
                   num_val_folds: int = 3,
                   trial: 'optuna.Trial' = None) -> float:
     """
-    Quick evaluation using k-fold cross-validation for more robust AUC estimation.
+    Quick evaluation using k-fold cross-validation optimized for multi-GPU.
     
     Returns:
         Mean AUC score across validation folds
@@ -88,6 +88,10 @@ def quick_evaluate(config: Dict[str, Any],
     n_folds = 3  # 3-fold CV for balance between speed and reliability
     fold_size = len(pos_pairs) // n_folds
     auc_scores = []
+    
+    # Enable mixed precision for RTX 5090
+    config['system'] = config.get('system', {})
+    config['system']['use_amp'] = torch.cuda.is_available()
     
     # Create model
     model = HGAT_LDA(
@@ -113,9 +117,10 @@ def quick_evaluate(config: Dict[str, Any],
         batch_size=int(config['training']['batch_size']),
         enable_progress=False,  # Disable progress for cleaner output
         neg_ratio=int(config['training']['neg_ratio']),
-        use_amp=config.get('system', {}).get('use_amp', False),
+        use_amp=config.get('system', {}).get('use_amp', torch.cuda.is_available()),  # Enable AMP for RTX 5090
         use_focal_loss=bool(config['training'].get('use_focal_loss', False)),
-        label_smoothing=float(config['training'].get('label_smoothing', 0.0))
+        label_smoothing=float(config['training'].get('label_smoothing', 0.0)),
+        cosine_tmax=config['training'].get('cosine_tmax', 50)  # Add cosine annealing
     )
     
     # Initialize evaluator once
@@ -408,11 +413,18 @@ def run_bayesian_optimization(base_config: Dict[str, Any],
             )
         )
     
-    # Optimize
+    # Optimize with multi-GPU parallelization
+    n_gpus = torch.cuda.device_count()
+    n_jobs = min(n_gpus, 4) if n_gpus > 1 else 1  # Parallel trials on multiple GPUs
+    
     print(f"\n🔍 Starting Bayesian optimization with {n_trials} trials...")
+    if n_jobs > 1:
+        print(f"🚀 Running {n_jobs} trials in parallel across {n_gpus} GPUs")
+    
     study.optimize(
         lambda trial: optuna_objective(trial, dataset_info, edges, pos_pairs, device, base_config, search_space),
         n_trials=n_trials,
+        n_jobs=n_jobs if n_jobs > 1 else 1,  # Parallel execution for multi-GPU
         show_progress_bar=True
     )
     

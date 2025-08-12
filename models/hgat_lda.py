@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple, Optional
+import warnings
 
 from models.layers import HeterogeneousGNNLayer, LinkPredictionMLP
 
