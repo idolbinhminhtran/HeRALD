@@ -202,7 +202,7 @@ def run_loocv(config: Dict[str, Any], dataset_info: Dict, edges: Dict, pos_pairs
     evaluator = HGATLDAEvaluator(model, device)
     
     # Run LOOCV
-    auc_scores = evaluator.run_loocv(
+    auc_scores = evaluator.leave_one_out_cross_validation(
         pos_pairs=pos_pairs,
         edges=edges,
         num_lncRNAs=dataset_info['num_lncRNAs'],
