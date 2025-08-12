@@ -83,10 +83,10 @@ class HGATLDATrainer:
             self.criterion = nn.BCEWithLogitsLoss()
             
         # Mixed precision scaler
-        if torch.cuda.is_available():
-            self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
+        if torch.cuda.is_available() and self.use_amp:
+            self.scaler = torch.amp.GradScaler()
         else:
-            self.scaler = torch.amp.GradScaler('cpu', enabled=False)
+            self.scaler = None
         
         # Optional scheduler
         self.scheduler = CosineAnnealingLR(self.optimizer, T_max=cosine_tmax) if cosine_tmax else None
@@ -154,9 +154,13 @@ class HGATLDATrainer:
                 loss = self.criterion(logits, labels)
             
             self.optimizer.zero_grad()
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                self.optimizer.step()
             if self.scheduler:
                 self.scheduler.step()
             
