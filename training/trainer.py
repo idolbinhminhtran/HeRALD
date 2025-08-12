@@ -84,7 +84,7 @@ class HGATLDATrainer:
             
         # Mixed precision scaler
         if torch.cuda.is_available() and self.use_amp:
-            self.scaler = torch.amp.GradScaler()
+            self.scaler = torch.cuda.amp.GradScaler()
         else:
             self.scaler = None
         
@@ -146,7 +146,7 @@ class HGATLDATrainer:
             
             # Use the new autocast API if AMP is enabled
             if self.use_amp:
-                with torch.amp.autocast('cuda', enabled=True):
+                with torch.cuda.amp.autocast(enabled=True):
                     logits = self.model(lnc_idx_batch, dis_idx_batch, edges_device)
                     loss = self.criterion(logits, labels)
             else:
