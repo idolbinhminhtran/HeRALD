@@ -58,7 +58,8 @@ class HGATLDATrainer:
                  loss_type: str = 'bce',
                  pairwise_type: str = 'bpr',
                  use_hard_negatives: bool = True,
-                 score_orientation: str = 'auto'):
+                 score_orientation: str = 'auto',
+                 score_sign: Optional[float] = None):
         """
         Initialize the trainer with optional multi-GPU support.
         
@@ -78,6 +79,8 @@ class HGATLDATrainer:
             pairwise_type: Type of pairwise loss ('bpr' or 'auc') when loss_type='pairwise'
             use_hard_negatives: Whether to use hard negative mining for pairwise losses
             score_orientation: Score orientation ('affinity', 'distance', or 'auto')
+            score_sign: Optional fixed sign to use when score_orientation='auto'. If provided,
+                calibration is skipped and this sign is used throughout training.
         """
         # Move model to device first
         self.model = model.to(device)
@@ -100,7 +103,8 @@ class HGATLDATrainer:
         self.pairwise_type = pairwise_type.lower()
         self.use_hard_negatives = use_hard_negatives
         self.score_orientation = score_orientation
-        self.score_sign = None  # Will be calibrated on first batch if orientation='auto'
+        # If provided, use fixed sign; otherwise will be calibrated on first batch if orientation='auto'
+        self.score_sign = score_sign
         self.calibrated = False
         
         # Optimizer with improved settings
@@ -159,7 +163,7 @@ class HGATLDATrainer:
             edges_device[key] = (src, dst, w)
         return edges_device
     
-    def calibrate_score_sign(self, pos_pairs: torch.Tensor, edges: Dict, batch_size: int = 64) -> None:
+    def calibrate_score_sign(self, pos_pairs: torch.Tensor, edges: Dict, batch_size: int = 512) -> None:
         """
         Calibrate score sign by sampling positives/negatives and checking raw score gap.
         
@@ -187,7 +191,7 @@ class HGATLDATrainer:
             # Generate negative pairs using the same method as training
             neg_pairs_all = generate_negative_pairs(pos_pairs, max_lnc, max_dis)
             
-            # Sample a small batch for calibration
+            # Sample a batch for calibration
             n_samples = min(batch_size, len(pos_pairs), len(neg_pairs_all))
             
             # Sample positives
@@ -215,6 +219,22 @@ class HGATLDATrainer:
                 
                 # Compute mean gap
                 gap = (raw_pos - raw_neg).mean().item()
+
+                # If the gap is too close to zero, resample with a larger batch for stability
+                if abs(gap) < 0.01:
+                    larger_batch = min(max(batch_size * 4, 1024), len(pos_pairs), len(neg_pairs_all))
+                    if larger_batch > n_samples:
+                        pos_indices = torch.randperm(len(pos_pairs))[:larger_batch]
+                        sample_pos = pos_pairs[pos_indices]
+                        neg_indices = torch.randperm(len(neg_pairs_all))[:larger_batch]
+                        sample_neg = neg_pairs_all[neg_indices]
+                        pos_lnc = sample_pos[:, 0].to(self.device)
+                        pos_dis = sample_pos[:, 1].to(self.device)
+                        neg_lnc = sample_neg[:, 0].to(self.device)
+                        neg_dis = sample_neg[:, 1].to(self.device)
+                        raw_pos = self.model(pos_lnc, pos_dis, edges_device)
+                        raw_neg = self.model(neg_lnc, neg_dis, edges_device)
+                        gap = (raw_pos - raw_neg).mean().item()
                 
                 # Set sign based on gap
                 self.score_sign = 1.0 if gap >= 0 else -1.0

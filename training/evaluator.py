@@ -382,7 +382,9 @@ class HGATLDAEvaluator:
                 use_focal_loss=use_focal_loss,  # Use focal loss from config
                 label_smoothing=label_smoothing,  # Use label smoothing from config
                 cosine_tmax=cosine_tmax if cosine_tmax else num_epochs,  # Use cosine annealing from config
-                use_multi_gpu=True  # Enable multi-GPU for each fold
+                use_multi_gpu=True,  # Enable multi-GPU for each fold
+                score_orientation=self.score_orientation,
+                score_sign=self.score_sign
             )
             
             # Generate negative pairs for this fold
@@ -625,8 +627,8 @@ class HGATLDAEvaluator:
                 save_path=None
             )
             
-            # Get calibrated score_sign from trainer
-            if trainer.score_sign is not None:
+            # Get calibrated score_sign from trainer (only the first time)
+            if self.score_sign is None and trainer.score_sign is not None:
                 self.score_sign = trainer.score_sign
             
             # Full-ranking evaluation with proper masking
