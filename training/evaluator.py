@@ -538,6 +538,33 @@ class HGATLDAEvaluator:
         
         # Import build_fold_edges
         from data.graph_construction import build_fold_edges
+
+        # One-time global calibration of score sign (stabilizes per-fold behavior)
+        if self.score_orientation == 'auto' and self.score_sign is None:
+            try:
+                base_trainer = HGATLDATrainer(
+                    model=self.model,
+                    device=self.device,
+                    lr=float(lr),
+                    weight_decay=float(weight_decay),
+                    batch_size=int(batch_size),
+                    enable_progress=False,
+                    neg_ratio=int(neg_ratio),
+                    use_amp=torch.cuda.is_available(),
+                    use_focal_loss=use_focal_loss,
+                    label_smoothing=label_smoothing,
+                    cosine_tmax=cosine_tmax if cosine_tmax else num_epochs,
+                    use_multi_gpu=False,
+                    score_orientation=self.score_orientation,
+                    score_sign=None
+                )
+                # Calibrate using the original edges (not per-fold)
+                base_trainer.calibrate_score_sign(pos_pairs, edges)
+                if base_trainer.score_sign is not None:
+                    self.score_sign = base_trainer.score_sign
+            except Exception:
+                # Fallback: leave as None; fold 1 will handle calibration
+                pass
         
         # Create config for build_fold_edges
         fold_config = {
@@ -610,7 +637,8 @@ class HGATLDAEvaluator:
                 label_smoothing=label_smoothing,
                 cosine_tmax=cosine_tmax if cosine_tmax else num_epochs,
                 use_multi_gpu=True,
-                score_orientation=self.score_orientation
+                score_orientation=self.score_orientation,
+                score_sign=self.score_sign
             )
             
             # Generate negative pairs for training
