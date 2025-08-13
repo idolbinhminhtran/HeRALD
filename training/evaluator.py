@@ -527,7 +527,6 @@ class HGATLDAEvaluator:
         print(f"\n{'='*70}")
         print(f"Starting LOOCV with rewrite for {num_folds} positive pairs")
         print(f"Evaluation settings: neg_sampling=False, full_ranking={full_ranking}")
-        print(f"Scoring: orientation={self.score_orientation}, score_sign=will be calibrated per fold")
         print(f"Disease rewrite enabled: {rewrite_isolated}")
         print(f"Training {num_epochs} epochs per fold (neg_ratio={neg_ratio} for training only)")
         print(f"{'='*70}")
@@ -627,9 +626,8 @@ class HGATLDAEvaluator:
             )
             
             # Get calibrated score_sign from trainer
-            fold_score_sign = trainer.get_score_sign()
-            if fold_score_sign is not None:
-                self.score_sign = fold_score_sign
+            if trainer.score_sign is not None:
+                self.score_sign = trainer.score_sign
             
             # Full-ranking evaluation with proper masking
             model_fold.eval()
@@ -661,7 +659,7 @@ class HGATLDAEvaluator:
                 # Calculate AUC with canonical affinity scores
                 fold_auc = roc_auc_score(lbl, s)
                 
-                # Check for inversion as WARNING ONLY
+                # Check for inversion as WARNING ONLY (should be rare with proper calibration)
                 fold_auc_inv = roc_auc_score(lbl, -s)
                 if fold_auc_inv > fold_auc + 1e-4:
                     print(f"  ⚠️ Fold {fold_idx+1}: inversion warning - auc_inv={fold_auc_inv:.3f} > auc={fold_auc:.3f}. Check score plumbing.")
@@ -694,13 +692,13 @@ class HGATLDAEvaluator:
                 mean_f1 = np.mean([r['f1_max'] for r in fold_results])
                 
                 # Compact single-line output for each fold with diagnostics
-                sign_str = '+1' if self.score_sign and self.score_sign > 0 else '-1' if self.score_sign else 'None'
+                score_sign_str = f"{'+1' if self.score_sign and self.score_sign > 0 else '-1'}" if self.score_sign else 'None'
                 print(f"Fold {fold_idx+1:4d}/{num_folds}: "
                       f"AUC={fold_auc:.3f} (mean={mean_auc:.3f}), "
                       f"rank={rank:3d}, "
-                      f"sign={sign_str}, "
                       f"edge={removed_edge_present}, "
-                      f"ld_edges={ld_edge_count}/855 "
+                      f"ld_edges={ld_edge_count}/855, "
+                      f"scoring={self.score_orientation}:{score_sign_str} "
                       f"{'[R]' if disease_was_rewritten else ''}")
                 
                 # Print summary every 100 folds

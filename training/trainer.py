@@ -159,80 +159,96 @@ class HGATLDATrainer:
             edges_device[key] = (src, dst, w)
         return edges_device
     
-    def calibrate_score_sign(self, pos_pairs: torch.Tensor, neg_pairs_all: torch.Tensor, 
-                             edges: Dict, batch_size: int = 256) -> None:
+    def calibrate_score_sign(self, pos_pairs: torch.Tensor, edges: Dict, batch_size: int = 256) -> None:
         """
-        Calibrate score sign by comparing positive and negative scores.
+        Calibrate score sign by sampling positives/negatives and checking raw score gap.
         
         Args:
-            pos_pairs: Positive training pairs
-            neg_pairs_all: All negative pairs
+            pos_pairs: All positive pairs for sampling
             edges: Graph edges
-            batch_size: Batch size for calibration
+            batch_size: Sample size for calibration
         """
         if self.score_orientation != 'auto':
             # Fixed orientation, no calibration needed
             return
-        
-        if self.calibrated:
+            
+        if self.score_sign is not None:
             # Already calibrated
             return
         
-        self.model.eval()
-        edges_device = self._move_edges_to_device(edges)
-        
         # Sample a small batch for calibration
-        num_samples = min(batch_size, len(pos_pairs))
-        sample_idx = torch.randperm(len(pos_pairs))[:num_samples]
-        sample_pos = pos_pairs[sample_idx]
+        n_pos = min(batch_size, len(pos_pairs))
+        sample_indices = torch.randperm(len(pos_pairs))[:n_pos]
+        sample_pos = pos_pairs[sample_indices]
         
         pos_lnc = sample_pos[:, 0].to(self.device)
         pos_dis = sample_pos[:, 1].to(self.device)
         
-        # For each positive, find a negative lncRNA for the same disease
-        neg_lnc_list = []
-        neg_dis_list = []
-        
-        # Build set of known positives for masking
+        # Create a set of known positives for masking
         known_positives = set()
         for l, d in pos_pairs:
             known_positives.add((l.item(), d.item()))
         
-        for i in range(len(pos_dis)):
-            d = pos_dis[i].item()
-            # Find negative lncRNAs for this disease (sample any lncRNA not associated with it)
-            valid_negs = []
-            for lnc_idx in range(472):  # Assuming 472 lncRNAs (should be passed as parameter)
-                if (lnc_idx, d) not in known_positives:
-                    valid_negs.append(lnc_idx)
-            if valid_negs:
-                # Sample one negative randomly
-                neg_lnc = valid_negs[torch.randint(len(valid_negs), (1,)).item()]
-                neg_lnc_list.append(torch.tensor(neg_lnc))
-                neg_dis_list.append(torch.tensor(d))
+        # For each positive, find a valid negative from same disease
+        neg_lnc = []
+        neg_dis = []
         
-        if not neg_lnc_list:
-            print("[Calibration] Warning: Could not find negatives for calibration, using default sign=+1")
+        for i, (l, d) in enumerate(zip(pos_lnc, pos_dis)):
+            d_val = d.item()
+            l_val = l.item()
+            
+            # Find candidate negative lncRNAs for this disease
+            # Sample from all lncRNAs and filter out known positives
+            max_lnc = max(pos_pairs[:, 0].max().item(), 500)  # Conservative estimate
+            candidates = []
+            attempts = 0
+            
+            while len(candidates) < 5 and attempts < 100:  # Try to find 5 candidates
+                rand_lnc = torch.randint(0, max_lnc, (10,)).to(self.device)
+                for rl in rand_lnc:
+                    if (rl.item(), d_val) not in known_positives and rl.item() != l_val:
+                        candidates.append(rl.item())
+                        if len(candidates) >= 5:
+                            break
+                attempts += 1
+            
+            if candidates:
+                # Pick first candidate as negative
+                neg_lnc.append(candidates[0])
+                neg_dis.append(d_val)
+        
+        if len(neg_lnc) == 0:
+            # Fallback: use random negatives
             self.score_sign = 1.0
-            self.calibrated = True
+            print("[Calib] No valid negatives found, defaulting to score_sign=+1")
             return
         
-        neg_lnc = torch.stack(neg_lnc_list).to(self.device)
-        neg_dis = torch.stack(neg_dis_list).to(self.device)
+        # Convert to tensors
+        neg_lnc = torch.tensor(neg_lnc, device=self.device)
+        neg_dis = torch.tensor(neg_dis, device=self.device)
+        
+        # Truncate positives to match negatives
+        pos_lnc = pos_lnc[:len(neg_lnc)]
+        pos_dis = pos_dis[:len(neg_dis)]
+        
+        # Move edges to device
+        edges_device = self._move_edges_to_device(edges)
         
         # Compute raw scores (no canonicalization)
+        self.model.eval()
         with torch.no_grad():
-            raw_pos = self.model(pos_lnc[:len(neg_lnc)], pos_dis[:len(neg_dis)], edges_device)
+            raw_pos = self.model(pos_lnc, pos_dis, edges_device)
             raw_neg = self.model(neg_lnc, neg_dis, edges_device)
-        
-        # Determine sign based on mean gap
-        gap = (raw_pos - raw_neg).mean().item()
-        self.score_sign = 1.0 if gap >= 0 else -1.0
-        self.calibrated = True
-        
-        print(f"[Calibration] score_orientation={self.score_orientation}, "
-              f"score_sign={'+1' if self.score_sign > 0 else '-1'}, "
-              f"mean_gap={gap:.4f}")
+            
+            # Compute mean gap
+            gap = (raw_pos - raw_neg).mean().item()
+            
+            # Set sign based on gap
+            self.score_sign = 1.0 if gap >= 0 else -1.0
+            
+            print(f"[Calib] score_orientation={self.score_orientation}, "
+                  f"score_sign={'+1' if self.score_sign > 0 else '-1'}, "
+                  f"mean_gap={gap:.4f}")
         
         self.model.train()
     
@@ -364,7 +380,7 @@ class HGATLDATrainer:
                         pos_scores = self.model(pos_lnc, pos_dis, edges_device)
                         neg_scores = self.model(neg_lnc, neg_dis, edges_device)
                         
-                        # Convert to canonical affinity scores (sign already calibrated)
+                        # Convert to canonical affinity scores
                         require_sign(self.score_orientation, self.score_sign)
                         aff_pos = canonical_affinity(pos_scores, self.score_orientation, self.score_sign)
                         aff_neg = canonical_affinity(neg_scores, self.score_orientation, self.score_sign)
@@ -379,7 +395,7 @@ class HGATLDATrainer:
                     pos_scores = self.model(pos_lnc, pos_dis, edges_device)
                     neg_scores = self.model(neg_lnc, neg_dis, edges_device)
                     
-                    # Convert to canonical affinity scores (sign already calibrated)
+                    # Convert to canonical affinity scores
                     require_sign(self.score_orientation, self.score_sign)
                     aff_pos = canonical_affinity(pos_scores, self.score_orientation, self.score_sign)
                     aff_neg = canonical_affinity(neg_scores, self.score_orientation, self.score_sign)
@@ -459,9 +475,6 @@ class HGATLDATrainer:
              val_split: float = 0.1,
              early_stopping_patience: int = 10,
              save_path: Optional[str] = None) -> Dict[str, list]:
-        # Calibrate score sign at the start of training
-        self.calibrate_score_sign(pos_pairs, neg_pairs_all, edges)
-        
         if self.enable_progress:
             print("\nGraph Statistics:")
             total_edges = 0
@@ -476,6 +489,9 @@ class HGATLDATrainer:
         num_val = int(len(pos_pairs) * val_split)
         train_pos = pos_pairs[num_val:]
         val_pos = pos_pairs[:num_val]
+        
+        # Calibrate score sign before training starts
+        self.calibrate_score_sign(pos_pairs, edges)
         
         best_val_loss = float('inf')
         patience_counter = 0

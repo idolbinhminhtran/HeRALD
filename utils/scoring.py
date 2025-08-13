@@ -7,6 +7,21 @@ import torch
 from typing import Optional, Union
 
 
+def require_sign(orientation: str, sign: Optional[float]) -> None:
+    """
+    Ensure that auto orientation has a calibrated sign.
+    
+    Args:
+        orientation: Score orientation mode
+        sign: Sign multiplier (should be non-None for auto mode)
+        
+    Raises:
+        ValueError: If auto orientation but sign is None
+    """
+    if orientation == "auto" and sign is None:
+        raise ValueError("auto orientation requires score_sign; got None")
+
+
 def canonical_affinity(raw_scores: torch.Tensor, 
                        orientation: str, 
                        sign_override: Optional[float] = None) -> torch.Tensor:
@@ -24,10 +39,11 @@ def canonical_affinity(raw_scores: torch.Tensor,
     Notes:
         - 'affinity': Raw scores already represent affinity (higher = better)
         - 'distance': Raw scores represent distance (lower = better), so negate
-        - 'auto': Use sign_override determined from calibration
+        - 'auto': Use sign_override determined from calibration (required)
     """
-    if sign_override is not None:
-        # When sign_override is provided, use it directly
+    if orientation == "auto":
+        # In auto mode, sign_override is required
+        require_sign(orientation, sign_override)
         return sign_override * raw_scores
     
     if orientation == "affinity":
@@ -38,26 +54,7 @@ def canonical_affinity(raw_scores: torch.Tensor,
         # Raw scores represent distance (lower = better), so negate
         return -raw_scores
     
-    if orientation == "auto":
-        # In auto mode, sign_override must be provided after calibration
-        raise ValueError("auto orientation requires score_sign to be calibrated; got None")
-    
     raise ValueError(f"model.score_orientation must be affinity|distance|auto, got {orientation}")
-
-
-def require_sign(orientation: str, sign: Optional[float]) -> None:
-    """
-    Require score_sign when orientation is 'auto'.
-    
-    Args:
-        orientation: Score orientation mode
-        sign: Score sign multiplier
-        
-    Raises:
-        ValueError: If orientation is 'auto' and sign is None
-    """
-    if orientation == "auto" and sign is None:
-        raise ValueError("auto orientation requires score_sign to be calibrated; got None")
 
 
 def calibrate_score_sign(pos_scores: torch.Tensor, 
