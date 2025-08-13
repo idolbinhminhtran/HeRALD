@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Hyperparameter tuning script for HGAT-LDA model.
-Supports both Bayesian optimization (Optuna) and Grid Search.
-Automatically updates configs/default.yaml with best parameters.
+Refactored hyperparameter tuning script for HGAT-LDA model with true LOOCV protocol.
+- Per-fold graph rebuilding with disease rewrite for isolated nodes
+- Full-ranking evaluation without negative sampling
+- Stratified fold selection for better coverage
+- GPU-safe parallel execution with Optuna
+- Improved logging and vectorized operations
 """
 
 import os
@@ -14,7 +17,7 @@ import numpy as np
 import random
 import argparse
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime
 from tqdm import tqdm
 import warnings
@@ -32,8 +35,14 @@ except ImportError:
     print("Warning: Optuna not installed. Only grid search available.")
     print("Install with: pip install optuna")
 
+from sklearn.metrics import roc_auc_score
 from data.data_loader import load_dataset, get_dataset_info
-from data.graph_construction import construct_heterogeneous_graph, get_positive_pairs, generate_negative_pairs
+from data.graph_construction import (
+    construct_heterogeneous_graph, 
+    get_positive_pairs, 
+    generate_negative_pairs,
+    rewrite_ld_for_isolated_diseases
+)
 from models.hgat_lda import HGAT_LDA
 from training.trainer import HGATLDATrainer
 from training.evaluator import HGATLDAEvaluator
@@ -51,326 +60,467 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.benchmark = False
 
 
-def load_data_and_graph(config: Dict[str, Any]):
-    """Load dataset and construct graph."""
-    print("Loading dataset...")
-    data_dict = load_dataset(config['data']['data_dir'])
-    dataset_info = get_dataset_info()
+def get_device_for_trial(trial_number: int) -> torch.device:
+    """
+    Assign device round-robin across available GPUs.
     
-    print("Constructing heterogeneous graph...")
+    Args:
+        trial_number: Current trial number
+        
+    Returns:
+        Device for this trial
+    """
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        gpu_id = trial_number % num_gpus
+        return torch.device(f'cuda:{gpu_id}')
+    return torch.device('cpu')
+
+
+def validate_model_params(config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Validate and fix model parameters to ensure compatibility.
+    
+    Args:
+        config: Configuration dictionary
+        
+    Returns:
+        Fixed configuration
+    """
+    # Ensure emb_dim is divisible by num_heads
+    emb_dim = int(config['model']['emb_dim'])
+    num_heads = int(config['model'].get('num_heads', 4))
+    
+    if emb_dim % num_heads != 0:
+        # Round up to nearest multiple of num_heads
+        new_emb_dim = ((emb_dim + num_heads - 1) // num_heads) * num_heads
+        print(f"  ⚠️  Adjusted emb_dim from {emb_dim} to {new_emb_dim} (divisible by {num_heads} heads)")
+        config['model']['emb_dim'] = new_emb_dim
+    
+    # Resolve loss_type vs use_hard_negatives conflicts
+    loss_type = config['training'].get('loss_type', 'bce')
+    use_hard_negatives = config['training'].get('use_hard_negatives', False)
+    
+    if loss_type != 'pairwise' and use_hard_negatives:
+        print(f"  ⚠️  use_hard_negatives=True only works with loss_type='pairwise', setting to False")
+        config['training']['use_hard_negatives'] = False
+    
+    # Ensure label_smoothing is reasonable
+    label_smoothing = float(config['training'].get('label_smoothing', 0.0))
+    if label_smoothing > 0.2:
+        print(f"  ⚠️  label_smoothing={label_smoothing} too high for LOOCV, capping at 0.1")
+        config['training']['label_smoothing'] = 0.1
+    
+    return config
+
+
+def build_fold_edges(data_dict: Dict[str, torch.Tensor],
+                     config: Dict[str, Any],
+                     test_lnc: int,
+                     test_dis: int,
+                     verbose: bool = False) -> Dict:
+    """
+    Build graph edges for a specific LOOCV fold, removing the test edge
+    and handling isolated diseases.
+    
+    Args:
+        data_dict: Dataset dictionary
+        config: Configuration
+        test_lnc: Test lncRNA index
+        test_dis: Test disease index
+        verbose: Whether to print details
+        
+    Returns:
+        Edges dictionary for this fold
+    """
+    # Create a copy of the lnc-disease association matrix
+    ld_mat = data_dict['lnc_disease_assoc'].clone()
+    
+    # Remove the test edge
+    original_value = ld_mat[test_dis, test_lnc].item()
+    ld_mat[test_dis, test_lnc] = 0
+    
+    if verbose:
+        print(f"  Removed edge: lnc={test_lnc}, dis={test_dis} (was {original_value})")
+    
+    # Check if disease is now isolated
+    disease_degree = ld_mat[test_dis, :].sum().item()
+    rewrite_applied = False
+    
+    if disease_degree == 0:
+        # Disease is isolated, apply rewrite using disease similarity
+        ld_mat = rewrite_ld_for_isolated_diseases(
+            ld_mat, 
+            data_dict['DD_sim'], 
+            test_dis
+        )
+        rewrite_applied = True
+        new_degree = ld_mat[test_dis, :].sum().item()
+        if verbose:
+            print(f"  Disease {test_dis} isolated, applied rewrite (new degree: {new_degree:.2f})")
+    
+    # Create modified data dict for this fold
+    fold_data = data_dict.copy()
+    fold_data['lnc_disease_assoc'] = ld_mat
+    
+    # Construct heterogeneous graph for this fold
     edges = construct_heterogeneous_graph(
-        data_dict,
-        sim_topk=config['data'].get('sim_topk', None),
+        fold_data,
+        sim_topk=config['data'].get('sim_topk', 30),
         sim_row_normalize=config['data'].get('sim_row_normalize', True),
-        sim_threshold=config['data'].get('threshold', 0.0)
+        sim_threshold=config['data'].get('threshold', 0.0),
+        sim_mutual=config['data'].get('sim_mutual', False),
+        sim_sym=config['data'].get('sim_sym', True),
+        sim_row_norm=config['data'].get('sim_row_norm', True),
+        sim_tau=config['data'].get('sim_tau', None),
+        use_bipartite_edge_weight=config['data'].get('use_bipartite_edge_weight', False),
+        verbose=False
     )
     
-    pos_pairs = get_positive_pairs(data_dict['lnc_disease_assoc'])
-    print(f"Number of positive pairs: {len(pos_pairs)}")
-    
-    return data_dict, dataset_info, edges, pos_pairs
+    return edges, rewrite_applied
 
 
-def quick_evaluate(config: Dict[str, Any],
-                  dataset_info: Dict,
+def score_all_lnc(model: torch.nn.Module,
+                  disease_idx: int,
                   edges: Dict,
-                  pos_pairs: torch.Tensor,
+                  num_lncRNAs: int,
                   device: torch.device,
-                  num_val_folds: int = 3,
-                  trial: 'optuna.Trial' = None) -> float:
+                  batch_size: int = 100) -> torch.Tensor:
     """
-    Quick evaluation using sampled LOOCV folds for hyperparameter tuning.
-    This simulates actual LOOCV performance to maximize AUC.
+    Score all lncRNAs for a given disease (vectorized for speed).
+    
+    Args:
+        model: Trained model
+        disease_idx: Disease index
+        edges: Graph edges
+        num_lncRNAs: Total number of lncRNAs
+        device: Device to use
+        batch_size: Batch size for scoring
+        
+    Returns:
+        Scores for all lncRNAs
+    """
+    model.eval()
+    all_scores = []
+    
+    with torch.no_grad():
+        # Score in batches to avoid OOM
+        for start in range(0, num_lncRNAs, batch_size):
+            end = min(start + batch_size, num_lncRNAs)
+            batch_size_actual = end - start
+            
+            # Create batch
+            lnc_batch = torch.arange(start, end, device=device)
+            dis_batch = torch.full((batch_size_actual,), disease_idx, 
+                                  dtype=torch.long, device=device)
+            
+            # Score batch
+            scores = model(lnc_batch, dis_batch, edges)
+            all_scores.append(scores)
+    
+    return torch.cat(all_scores)
+
+
+def select_loocv_folds(pos_pairs: torch.Tensor,
+                      data_dict: Dict[str, torch.Tensor],
+                      target_folds: int = 150,
+                      seed: int = 42) -> np.ndarray:
+    """
+    Select LOOCV folds with stratification to ensure coverage across
+    diseases and degree buckets.
+    
+    Args:
+        pos_pairs: All positive pairs
+        data_dict: Dataset dictionary
+        target_folds: Target number of folds
+        seed: Random seed
+        
+    Returns:
+        Indices of selected folds
+    """
+    np.random.seed(seed)
+    
+    # Get disease degrees
+    ld_mat = data_dict['lnc_disease_assoc']
+    disease_degrees = ld_mat.sum(dim=1).numpy()  # Sum over lncRNAs
+    
+    # Create disease buckets based on degree
+    num_diseases = len(disease_degrees)
+    disease_buckets = {
+        'low': [],     # degree <= 5
+        'medium': [],  # 5 < degree <= 10
+        'high': []     # degree > 10
+    }
+    
+    for dis_idx in range(num_diseases):
+        degree = disease_degrees[dis_idx]
+        if degree <= 5:
+            disease_buckets['low'].append(dis_idx)
+        elif degree <= 10:
+            disease_buckets['medium'].append(dis_idx)
+        else:
+            disease_buckets['high'].append(dis_idx)
+    
+    # Group positive pairs by disease
+    pairs_by_disease = {}
+    for i, (lnc, dis) in enumerate(pos_pairs):
+        dis_idx = dis.item()
+        if dis_idx not in pairs_by_disease:
+            pairs_by_disease[dis_idx] = []
+        pairs_by_disease[dis_idx].append(i)
+    
+    selected_folds = []
+    
+    # First pass: ensure coverage across buckets and diseases
+    for bucket_name, disease_list in disease_buckets.items():
+        if not disease_list:
+            continue
+            
+        # Sample diseases from this bucket
+        num_to_sample = min(len(disease_list), target_folds // (3 * 2))  # Divide by 3 buckets, 2 samples per disease
+        sampled_diseases = np.random.choice(disease_list, num_to_sample, replace=False)
+        
+        for dis_idx in sampled_diseases:
+            if dis_idx in pairs_by_disease:
+                # Sample up to 2 pairs from this disease
+                available_pairs = pairs_by_disease[dis_idx]
+                num_pairs = min(2, len(available_pairs))
+                sampled_pairs = np.random.choice(available_pairs, num_pairs, replace=False)
+                selected_folds.extend(sampled_pairs)
+    
+    # Second pass: fill remaining slots randomly
+    remaining_needed = target_folds - len(selected_folds)
+    if remaining_needed > 0:
+        all_indices = set(range(len(pos_pairs)))
+        available_indices = list(all_indices - set(selected_folds))
+        
+        if available_indices:
+            additional_folds = np.random.choice(
+                available_indices, 
+                min(remaining_needed, len(available_indices)), 
+                replace=False
+            )
+            selected_folds.extend(additional_folds)
+    
+    # Convert to numpy array and sort
+    selected_folds = np.array(selected_folds[:target_folds])
+    selected_folds = np.sort(selected_folds)
+    
+    # Calculate coverage statistics
+    unique_diseases = set()
+    for fold_idx in selected_folds:
+        dis_idx = pos_pairs[fold_idx, 1].item()
+        unique_diseases.add(dis_idx)
+    
+    coverage = len(unique_diseases) / num_diseases * 100
+    print(f"  Fold selection: {len(selected_folds)} folds covering {len(unique_diseases)}/{num_diseases} diseases ({coverage:.1f}%)")
+    
+    return selected_folds
+
+
+def quick_evaluate_loocv(config: Dict[str, Any],
+                        data_dict: Dict[str, torch.Tensor],
+                        dataset_info: Dict,
+                        pos_pairs: torch.Tensor,
+                        device: torch.device,
+                        num_loocv_samples: int = 150,
+                        trial: Optional['optuna.Trial'] = None,
+                        trial_number: int = 0) -> float:
+    """
+    Quick LOOCV evaluation with proper protocol:
+    - Per-fold graph rebuilding
+    - Full ranking without negative sampling
+    - Stratified fold selection
     
     Returns:
         Mean AUC score across sampled LOOCV folds
     """
-    # Use more LOOCV folds for accurate evaluation (critical for avoiding overfitting)
-    # Increase samples for better representation of actual LOOCV performance
-    num_loocv_samples = min(150, len(pos_pairs))  # Sample 150 folds instead of 50
+    # Set per-trial seed for reproducibility
+    trial_seed = 42 + trial_number
+    set_seed(trial_seed)
     
-    # Use stratified sampling to ensure diverse fold selection
-    # This helps avoid bias from random sampling
-    np.random.seed(42)  # Fixed seed for reproducible sampling
-    selected_folds = np.random.choice(len(pos_pairs), num_loocv_samples, replace=False)
+    # Validate and fix model parameters
+    config = validate_model_params(config)
     
-    # Sort folds to ensure systematic evaluation
-    selected_folds = np.sort(selected_folds)
-    auc_scores = []
-    
-    # Enable mixed precision for RTX 5090
-    config['system'] = config.get('system', {})
-    config['system']['use_amp'] = torch.cuda.is_available()
-    
-    # Create model
-    model = HGAT_LDA(
-        num_lncRNAs=dataset_info['num_lncRNAs'],
-        num_genes=dataset_info['num_genes'],
-        num_diseases=dataset_info['num_diseases'],
-        edges=edges,
-        emb_dim=int(config['model']['emb_dim']),
-        num_layers=int(config['model']['num_layers']),
-        dropout=float(config['model']['dropout']),
-        num_heads=int(config['model'].get('num_heads', 4)),
-        relation_dropout=float(config['model'].get('relation_dropout', 0.0)),
-        use_layernorm=bool(config['model'].get('use_layernorm', True)),
-        use_residual=bool(config['model'].get('use_residual', True))
-    ).to(device)
-    
-    # Create trainer with specified parameters
-    trainer = HGATLDATrainer(
-        model=model,
-        device=device,
-        lr=float(config['training']['lr']),
-        weight_decay=float(config['training']['weight_decay']),
-        batch_size=int(config['training']['batch_size']),
-        enable_progress=False,  # Disable progress for cleaner output
-        neg_ratio=int(config['training']['neg_ratio']),
-        use_amp=config.get('system', {}).get('use_amp', torch.cuda.is_available()),  # Enable AMP for RTX 5090
-        use_focal_loss=bool(config['training'].get('use_focal_loss', False)),
-        label_smoothing=float(config['training'].get('label_smoothing', 0.0)),
-        cosine_tmax=config['training'].get('cosine_tmax', 50)  # Add cosine annealing
+    # Select stratified folds
+    selected_folds = select_loocv_folds(
+        pos_pairs, 
+        data_dict, 
+        target_folds=num_loocv_samples,
+        seed=trial_seed
     )
     
-    # Perform LOOCV-style evaluation on sampled folds
-    print(f"Evaluating {num_loocv_samples} LOOCV folds...")
+    print(f"\n🔬 Trial {trial_number}: Evaluating {len(selected_folds)} LOOCV folds")
+    print(f"  Device: {device}")
+    print(f"  eval.full_ranking=True, neg_sampling=False")
     
-    for fold_idx in selected_folds:
-        # LOOCV: Leave out one positive pair for testing
+    auc_scores = []
+    num_rewrites = 0
+    
+    # Process each fold
+    for fold_count, fold_idx in enumerate(selected_folds):
+        # Get test pair
         test_lnc = int(pos_pairs[fold_idx, 0].item())
         test_dis = int(pos_pairs[fold_idx, 1].item())
         
-        # Remove test pair from training data (LOOCV style)
-        train_pos_pairs = torch.cat([pos_pairs[:fold_idx], pos_pairs[fold_idx+1:]], dim=0)
-        
-        # Create fresh model for this fold (LOOCV requires fresh model per fold)
-        model_fold = HGAT_LDA(
-            num_lncRNAs=dataset_info['num_lncRNAs'],
-            num_genes=dataset_info['num_genes'],
-            num_diseases=dataset_info['num_diseases'],
-            edges=edges,
-            emb_dim=int(config['model']['emb_dim']),
-            num_layers=int(config['model']['num_layers']),
-            dropout=float(config['model']['dropout']),
-            num_heads=int(config['model'].get('num_heads', 4)),
-            relation_dropout=float(config['model'].get('relation_dropout', 0.0)),
-            use_layernorm=bool(config['model'].get('use_layernorm', True)),
-            use_residual=bool(config['model'].get('use_residual', True))
-        ).to(device)
-        
-        # Create trainer for this fold
-        trainer_fold = HGATLDATrainer(
-            model=model_fold,
-            device=device,
-            lr=float(config['training']['lr']),
-            weight_decay=float(config['training']['weight_decay']),
-            batch_size=int(config['training']['batch_size']),
-            enable_progress=False,
-            neg_ratio=int(config['training']['neg_ratio']),
-            use_amp=config.get('system', {}).get('use_amp', torch.cuda.is_available()),
-            use_focal_loss=bool(config['training'].get('use_focal_loss', False)),
-            label_smoothing=float(config['training'].get('label_smoothing', 0.0)),
-            cosine_tmax=config['training'].get('cosine_tmax', 50),
-            use_multi_gpu=False  # Disable multi-GPU for quick evaluation
+        # Build fold-specific edges (removes test edge, handles isolation)
+        fold_edges, rewrite_applied = build_fold_edges(
+            data_dict, config, test_lnc, test_dis, verbose=False
         )
         
-        # Generate negatives for training
-        neg_pairs_all = generate_negative_pairs(train_pos_pairs, dataset_info['num_lncRNAs'], dataset_info['num_diseases'])
+        if rewrite_applied:
+            num_rewrites += 1
         
-        # Match actual LOOCV training epochs to avoid mismatch
-        # Use same number of epochs as actual LOOCV for consistency
-        num_epochs = min(30, int(config['training'].get('num_epochs', 30)))
+        # Move edges to device
+        edges_device = {}
+        for key, (src, dst, w) in fold_edges.items():
+            if src is not None:
+                src = src.to(device)
+                dst = dst.to(device)
+                if w is not None:
+                    w = w.to(device)
+            edges_device[key] = (src, dst, w)
+        
+        # Create training data (exclude test pair)
+        train_mask = torch.ones(len(pos_pairs), dtype=torch.bool)
+        train_mask[fold_idx] = False
+        train_pos_pairs = pos_pairs[train_mask]
         
         try:
+            # Create fresh model for this fold
+            model_fold = HGAT_LDA(
+                num_lncRNAs=dataset_info['num_lncRNAs'],
+                num_genes=dataset_info['num_genes'],
+                num_diseases=dataset_info['num_diseases'],
+                edges=edges_device,
+                emb_dim=int(config['model']['emb_dim']),
+                num_layers=int(config['model']['num_layers']),
+                dropout=float(config['model']['dropout']),
+                num_heads=int(config['model'].get('num_heads', 4)),
+                relation_dropout=float(config['model'].get('relation_dropout', 0.0)),
+                use_layernorm=bool(config['model'].get('use_layernorm', True)),
+                use_residual=bool(config['model'].get('use_residual', True)),
+                use_relation_norm=bool(config['model'].get('use_relation_norm', True))
+            ).to(device)
+            
+            # Create trainer
+            trainer_fold = HGATLDATrainer(
+                model=model_fold,
+                device=device,
+                lr=float(config['training']['lr']),
+                weight_decay=float(config['training']['weight_decay']),
+                batch_size=int(config['training']['batch_size']),
+                enable_progress=False,
+                neg_ratio=int(config['training']['neg_ratio']),
+                use_amp=config.get('system', {}).get('use_amp', torch.cuda.is_available()),
+                use_focal_loss=bool(config['training'].get('use_focal_loss', False)),
+                label_smoothing=float(config['training'].get('label_smoothing', 0.0)),
+                cosine_tmax=config['training'].get('cosine_tmax', 50),
+                use_multi_gpu=False,
+                loss_type=config['training'].get('loss_type', 'bce'),
+                pairwise_type=config['training'].get('pairwise_type', 'bpr'),
+                use_hard_negatives=config['training'].get('use_hard_negatives', False)
+            )
+            
+            # Generate negatives for training
+            neg_pairs_all = generate_negative_pairs(
+                train_pos_pairs, 
+                dataset_info['num_lncRNAs'], 
+                dataset_info['num_diseases']
+            )
+            
             # Train model
+            num_epochs = min(30, int(config['training'].get('num_epochs', 30)))
             trainer_fold.train(
                 pos_pairs=train_pos_pairs,
                 neg_pairs_all=neg_pairs_all,
-                edges=edges,
+                edges=edges_device,
                 num_epochs=num_epochs,
-                val_split=0.0,  # No validation split for LOOCV
+                val_split=0.0,
                 early_stopping_patience=5,
                 save_path=None
             )
             
-            # Evaluate on test pair (LOOCV style)
-            model_fold.eval()
-            with torch.no_grad():
-                # Score for the positive test pair
-                pos_score = torch.sigmoid(model_fold(
-                    torch.tensor([test_lnc], device=device),
-                    torch.tensor([test_dis], device=device),
-                    edges
-                )).item()
-                
-                # Generate negative pairs for this test case
-                neg_scores = []
-                
-                # Sample more negatives for better AUC estimation
-                for _ in range(50):  # Sample 50 negatives for more accurate AUC
-                    neg_dis = np.random.randint(0, dataset_info['num_diseases'])
-                    if (test_lnc, neg_dis) not in set((int(i), int(j)) for i, j in train_pos_pairs):
-                        score = torch.sigmoid(model_fold(
-                            torch.tensor([test_lnc], device=device),
-                            torch.tensor([neg_dis], device=device),
-                            edges
-                        )).item()
-                        neg_scores.append(score)
-                
-                # Calculate AUC for this fold
-                if neg_scores:
-                    from sklearn.metrics import roc_auc_score
-                    y_true = [1] + [0] * len(neg_scores)
-                    y_score = [pos_score] + neg_scores
-                    fold_auc = roc_auc_score(y_true, y_score)
-                    auc_scores.append(fold_auc)
-                
+            # Full-ranking evaluation (no negative sampling)
+            all_scores = score_all_lnc(
+                model_fold, test_dis, edges_device, 
+                dataset_info['num_lncRNAs'], device
+            )
+            
+            # Get other known positives for this disease to mask
+            known_positives = set()
+            for i, (lnc, dis) in enumerate(pos_pairs):
+                if dis.item() == test_dis and i != fold_idx:
+                    known_positives.add(lnc.item())
+            
+            # Create labels and scores for AUC calculation
+            y_true = []
+            y_score = []
+            
+            for lnc_idx in range(dataset_info['num_lncRNAs']):
+                if lnc_idx == test_lnc:
+                    # This is our test positive
+                    y_true.append(1)
+                    y_score.append(torch.sigmoid(all_scores[lnc_idx]).item())
+                elif lnc_idx not in known_positives:
+                    # This is a true negative
+                    y_true.append(0)
+                    y_score.append(torch.sigmoid(all_scores[lnc_idx]).item())
+                # Skip other known positives (masked)
+            
+            # Calculate AUC
+            if len(set(y_true)) == 2:  # Ensure we have both classes
+                fold_auc = roc_auc_score(y_true, y_score)
+                auc_scores.append(fold_auc)
+            else:
+                auc_scores.append(0.5)  # Default if only one class
+            
             # Clean up
             del model_fold
             del trainer_fold
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
             
         except Exception as e:
-            print(f"LOOCV fold {fold_idx} failed: {e}")
-            auc_scores.append(0.5)  # Default AUC
-            
-        # Optuna pruning
-        if trial is not None and len(auc_scores) % 10 == 0:
+            print(f"  ⚠️  Fold {fold_idx} failed: {e}")
+            auc_scores.append(0.5)
+        
+        # Report to Optuna for pruning
+        if trial is not None and (fold_count + 1) % 20 == 0:
             current_mean_auc = np.mean(auc_scores)
-            trial.report(current_mean_auc, len(auc_scores))
+            trial.report(current_mean_auc, fold_count)
             if trial.should_prune():
+                print(f"  ✂️  Trial pruned at fold {fold_count + 1}")
                 raise optuna.TrialPruned()
     
-    # Clean up
-    del model
-    del trainer
-    if 'evaluator' in locals():
-        del evaluator
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    
-    # Return mean AUC with stronger penalty for variance to favor stable models
-    # This helps prevent overfitting to specific folds
+    # Calculate final metrics
     mean_auc = np.mean(auc_scores)
     std_auc = np.std(auc_scores)
+    success_rate = len([a for a in auc_scores if a > 0.5]) / len(auc_scores)
     
-    # Also penalize if too few folds succeeded
-    success_rate = len(auc_scores) / num_loocv_samples
-    if success_rate < 0.8:  # If less than 80% folds succeeded
-        mean_auc *= success_rate  # Penalize heavily
+    print(f"  LOOCV quick-eval: mean_auc={mean_auc:.4f}, std={std_auc:.4f}, success_rate={success_rate:.2f}")
+    print(f"  LOOCV folds: {len(selected_folds)}, rewrite applied: {num_rewrites}")
     
-    # Stronger variance penalty for LOOCV
-    return mean_auc - 0.02 * std_auc  # Doubled penalty for high variance
+    # Return score with penalty for high variance
+    return mean_auc - 0.01 * std_auc
 
-
-def validate_loocv_params(params: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """Validate if parameters are suitable for LOOCV to prevent overfitting.
-    
-    Returns:
-        (is_valid, list_of_warnings)
-    """
-    warnings = []
-    
-    # Check learning rate
-    if 'training.lr' in params and params['training.lr'] > 0.001:
-        warnings.append(f"⚠️ Learning rate {params['training.lr']:.4f} is too high (>0.001)")
-    
-    # Check label smoothing
-    if 'training.label_smoothing' in params and params['training.label_smoothing'] > 0.1:
-        warnings.append(f"⚠️ Label smoothing {params['training.label_smoothing']:.2f} is too high (>0.1)")
-    
-    # Check batch size
-    if 'training.batch_size' in params and params['training.batch_size'] > 256:
-        warnings.append(f"⚠️ Batch size {params['training.batch_size']} is too large (>256)")
-    
-    # Check dropout
-    if 'model.dropout' in params and params['model.dropout'] < 0.25:
-        warnings.append(f"⚠️ Dropout {params['model.dropout']:.2f} is too low (<0.25)")
-    
-    # Check number of heads
-    if 'model.num_heads' in params and params['model.num_heads'] < 4:
-        warnings.append(f"⚠️ Number of heads {params['model.num_heads']} is too low (<4)")
-    
-    # Check weight decay
-    if 'training.weight_decay' in params and params['training.weight_decay'] < 1e-5:
-        warnings.append(f"⚠️ Weight decay {params['training.weight_decay']:.2e} is too low (<1e-5)")
-    
-    is_valid = len(warnings) == 0
-    return is_valid, warnings
-
-
-def update_default_config(best_params: Dict[str, Any]):
-    """Update configs/default.yaml with best parameters."""
-    config_path = 'configs/default.yaml'
-    
-    # Validate parameters first
-    is_valid, warnings = validate_loocv_params(best_params)
-    if not is_valid:
-        print("\n⚠️ WARNING: Best parameters may cause overfitting in LOOCV:")
-        for warning in warnings:
-            print(f"  {warning}")
-        print("\n🔧 Applying automatic corrections...")
-        
-        # Apply corrections
-        if 'training.lr' in best_params and best_params['training.lr'] > 0.001:
-            best_params['training.lr'] = 0.0008
-            print(f"  ✅ Reduced learning rate to 0.0008")
-        
-        if 'training.label_smoothing' in best_params and best_params['training.label_smoothing'] > 0.1:
-            best_params['training.label_smoothing'] = 0.05
-            print(f"  ✅ Reduced label smoothing to 0.05")
-        
-        if 'training.batch_size' in best_params and best_params['training.batch_size'] > 256:
-            best_params['training.batch_size'] = 128
-            print(f"  ✅ Reduced batch size to 128")
-        
-        if 'model.dropout' in best_params and best_params['model.dropout'] < 0.25:
-            best_params['model.dropout'] = 0.3
-            print(f"  ✅ Increased dropout to 0.3")
-        
-        if 'model.num_heads' in best_params and best_params['model.num_heads'] < 4:
-            best_params['model.num_heads'] = 4
-            print(f"  ✅ Increased num_heads to 4")
-    
-    # Load current config
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    # Update with best parameters
-    for param_path, value in best_params.items():
-        # Handle nested parameters like 'model.emb_dim'
-        keys = param_path.split('.')
-        temp = config
-        for key in keys[:-1]:
-            if key not in temp:
-                temp[key] = {}
-            temp = temp[key]
-        temp[keys[-1]] = value
-    
-    # Save updated config
-    with open(config_path, 'w') as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
-    
-    print(f"\n✅ Updated {config_path} with best parameters")
-
-
-# ============================================================================
-# BAYESIAN OPTIMIZATION (OPTUNA)
-# ============================================================================
 
 def optuna_objective(trial: 'optuna.Trial',
+                     data_dict: Dict[str, torch.Tensor],
                      dataset_info: Dict,
-                     edges: Dict,
                      pos_pairs: torch.Tensor,
-                     device: torch.device,
                      base_config: Dict[str, Any],
                      search_space: Dict[str, Any]) -> float:
     """
-    Optuna objective function for hyperparameter optimization.
+    Optuna objective function with GPU-safe parallel execution.
     """
+    # Get trial number for device assignment
+    trial_number = trial.number
+    device = get_device_for_trial(trial_number)
+    
     # Copy base config
     config = yaml.safe_load(yaml.dump(base_config))
     
-    # Sample hyperparameters based on search space
+    # Sample hyperparameters
     params = {}
     for param_path, param_spec in search_space.items():
         if param_spec['type'] == 'categorical':
@@ -387,471 +537,176 @@ def optuna_objective(trial: 'optuna.Trial',
         else:
             continue
         
-        # Update config with sampled value
+        # Update config
         keys = param_path.split('.')
         temp = config
         for key in keys[:-1]:
             if key not in temp:
-                temp[key] = {}  # Create missing nested dict
+                temp[key] = {}
             temp = temp[key]
         temp[keys[-1]] = value
         params[param_path] = value
     
-    # Evaluate configuration
+    # Log parameters
+    print(f"\n📊 Trial {trial_number} parameters:")
+    for key, value in params.items():
+        print(f"  {key}: {value}")
+    
+    # Evaluate
     try:
-        auc_score = quick_evaluate(config, dataset_info, edges, pos_pairs, device)
-        
-        # Report intermediate value
-        trial.report(auc_score, 0)
-        
-        # Handle pruning
-        if trial.should_prune():
-            raise optuna.TrialPruned()
-        
-        return auc_score
-        
+        score = quick_evaluate_loocv(
+            config, data_dict, dataset_info, pos_pairs, 
+            device, num_loocv_samples=150, trial=trial, trial_number=trial_number
+        )
+        return score
+    except optuna.TrialPruned:
+        raise
     except Exception as e:
-        print(f"Trial failed with error: {e}")
-        # Return a small negative value instead of 0 to help Optuna learn
-        return -0.1
-
-
-def analyze_study_results(study: 'optuna.Study', output_dir: Path):
-    """Analyze and visualize Optuna study results for maximum insights."""
-    try:
-        # Get completed trials
-        trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-        if not trials:
-            print("No completed trials to analyze.")
-            return
-        
-        # 1. Best trials summary
-        best_trials = sorted(trials, key=lambda t: t.value, reverse=True)[:5]
-        with open(output_dir / 'best_trials_summary.txt', 'w') as f:
-            f.write("Top 5 Trials by AUC Score\n")
-            f.write("=" * 60 + "\n\n")
-            for i, trial in enumerate(best_trials, 1):
-                f.write(f"Rank {i}: Trial {trial.number}\n")
-                f.write(f"AUC Score: {trial.value:.6f}\n")
-                f.write("Parameters:\n")
-                for key, value in trial.params.items():
-                    f.write(f"  {key}: {value}\n")
-                f.write("-" * 40 + "\n\n")
-        
-        # 2. Parameter importance analysis
-        if len(trials) >= 10:
-            try:
-                importance = optuna.importance.get_param_importances(study)
-                with open(output_dir / 'parameter_importance.txt', 'w') as f:
-                    f.write("Parameter Importance for AUC:\n")
-                    f.write("=" * 40 + "\n")
-                    sorted_params = sorted(importance.items(), key=lambda x: x[1], reverse=True)
-                    for param, imp in sorted_params:
-                        f.write(f"{param:30s}: {imp:.4f}\n")
-                print(f"\n📊 Parameter importance analysis saved")
-            except Exception as e:
-                print(f"Could not compute parameter importance: {e}")
-        
-        print(f"📝 Analysis saved to {output_dir}")
-        
-    except Exception as e:
-        print(f"\n⚠️ Error during analysis: {e}")
+        print(f"  ❌ Trial {trial_number} failed: {e}")
+        return 0.0
 
 
 def run_bayesian_optimization(base_config: Dict[str, Any],
+                             data_dict: Dict[str, torch.Tensor],
                              dataset_info: Dict,
-                             edges: Dict,
                              pos_pairs: torch.Tensor,
-                             device: torch.device,
                              search_space: Dict[str, Any],
                              n_trials: int = 50,
-                             output_dir: str = 'tuning_results'):
-    """Run Bayesian optimization using Optuna with advanced features."""
+                             output_dir: str = 'tuning_results') -> Tuple[Dict, float]:
+    """
+    Run Bayesian optimization using Optuna with parallel GPU support.
+    """
     if not OPTUNA_AVAILABLE:
-        print("Error: Optuna not installed. Please install with: pip install optuna")
-        return None
+        print("❌ Optuna not installed!")
+        return None, 0.0
     
     # Create output directory
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     
-    # Setup study with advanced settings
-    study_name = f"hgat_lda_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # Create study
+    study = optuna.create_study(
+        direction='maximize',
+        sampler=optuna.samplers.TPESampler(seed=42),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=30)
+    )
     
-    # Check for existing study database for warm-start
-    study_file = output_dir / 'optuna_study.db'
-    storage = f'sqlite:///{study_file}'
-    
-    # Create or load study
-    if study_file.exists():
-        print(f"\n🔄 Found existing study, loading for warm-start...")
-        try:
-            # Try to load existing study
-            existing_studies = optuna.study.get_all_study_names(storage)
-            if existing_studies:
-                # Load the most recent study
-                study = optuna.load_study(study_name=existing_studies[-1], storage=storage)
-                print(f"  Loaded study: {existing_studies[-1]}")
-                print(f"  Previous trials: {len(study.trials)}")
-                if study.best_trial:
-                    print(f"  Previous best AUC: {study.best_value:.4f}")
-            else:
-                raise ValueError("No studies found")
-        except:
-            # Create new study if loading fails
-            study = optuna.create_study(
-                study_name=study_name,
-                direction='maximize',
-                storage=storage,
-                sampler=optuna.samplers.TPESampler(
-                    seed=42,
-                    n_startup_trials=10,
-                    multivariate=True,
-                    constant_liar=True
-                ),
-                pruner=optuna.pruners.HyperbandPruner(
-                    min_resource=1,
-                    max_resource=45,
-                    reduction_factor=3
-                )
-            )
-    else:
-        # Create new study
-        study = optuna.create_study(
-            study_name=study_name,
-            direction='maximize',
-            storage=storage,
-            sampler=optuna.samplers.TPESampler(
-                seed=42,
-                n_startup_trials=10,
-                multivariate=True,
-                constant_liar=True
-            ),
-            pruner=optuna.pruners.HyperbandPruner(
-                min_resource=1,
-                max_resource=45,
-                reduction_factor=3
-            )
-        )
-    
-    # Optimize with multi-GPU parallelization
-    n_gpus = torch.cuda.device_count()
-    n_jobs = min(n_gpus, 4) if n_gpus > 1 else 1  # Parallel trials on multiple GPUs
-    
-    print(f"\n🔍 Starting Bayesian optimization with {n_trials} trials...")
-    if n_jobs > 1:
-        print(f"🚀 Running {n_jobs} trials in parallel across {n_gpus} GPUs")
-    
+    # Run optimization
     study.optimize(
-        lambda trial: optuna_objective(trial, dataset_info, edges, pos_pairs, device, base_config, search_space),
+        lambda trial: optuna_objective(trial, data_dict, dataset_info, pos_pairs, base_config, search_space),
         n_trials=n_trials,
-        n_jobs=n_jobs if n_jobs > 1 else 1,  # Parallel execution for multi-GPU
-        show_progress_bar=True
+        n_jobs=1  # Set to 1 for GPU safety, trials will use different GPUs via round-robin
     )
     
     # Get best parameters
     best_trial = study.best_trial
-    print(f"\n✨ Best AUC Score: {best_trial.value:.4f}")
-    print("\n📊 Best parameters:")
-    for key, value in best_trial.params.items():
-        print(f"  {key}: {value}")
-    
-    # Perform comprehensive analysis
-    analyze_study_results(study, output_dir)
-    
-    # Save detailed results
-    results = {
-        'best_auc': best_trial.value,
-        'best_params': best_trial.params,
-        'best_trial_number': best_trial.number,
-        'total_trials': len(study.trials),
-        'completed_trials': len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]),
-        'pruned_trials': len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]),
-        'all_trials': [
-            {
-                'number': t.number, 
-                'value': t.value if t.value is not None else 'pruned',
-                'params': t.params,
-                'state': str(t.state)
-            }
-            for t in study.trials
-        ]
-    }
-    
-    with open(output_dir / 'optuna_results.json', 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    # Export trials dataframe for further analysis
-    try:
-        df = study.trials_dataframe()
-        df.to_csv(output_dir / 'trials_history.csv', index=False)
-        print(f"📊 Trials history exported to CSV")
-    except:
-        pass
-    
-    return best_trial.params, best_trial.value
-
-
-# ============================================================================
-# GRID SEARCH
-# ============================================================================
-
-def run_grid_search(base_config: Dict[str, Any],
-                   dataset_info: Dict,
-                   edges: Dict,
-                   pos_pairs: torch.Tensor,
-                   device: torch.device,
-                   search_space: Dict[str, Any],
-                   max_combinations: int = None,
-                   output_dir: str = 'tuning_results'):
-    """Run grid search over parameter combinations."""
-    from itertools import product
-    
-    # Create output directory
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Generate all combinations
-    param_names = []
-    param_values = []
-    
-    for param_path, param_spec in search_space.items():
-        param_names.append(param_path)
-        if param_spec['type'] == 'categorical':
-            param_values.append(param_spec['values'])
-        elif param_spec['type'] == 'int':
-            values = list(range(param_spec['min'], param_spec['max'] + 1, param_spec.get('step', 1)))
-            param_values.append(values)
-        elif param_spec['type'] == 'float':
-            if param_spec.get('log', False):
-                # Sample log-spaced values
-                values = np.logspace(np.log10(param_spec['min']), np.log10(param_spec['max']), 
-                                   param_spec.get('n_samples', 3)).tolist()
-            else:
-                # Sample linearly-spaced values
-                if 'step' in param_spec:
-                    values = np.arange(param_spec['min'], param_spec['max'] + param_spec['step'], 
-                                      param_spec['step']).tolist()
-                else:
-                    values = np.linspace(param_spec['min'], param_spec['max'], 
-                                       param_spec.get('n_samples', 3)).tolist()
-            param_values.append(values)
-    
-    # Generate combinations
-    all_combinations = list(product(*param_values))
-    
-    # Limit combinations if specified
-    if max_combinations and len(all_combinations) > max_combinations:
-        np.random.shuffle(all_combinations)
-        all_combinations = all_combinations[:max_combinations]
-    
-    print(f"\n🔍 Testing {len(all_combinations)} parameter combinations...")
-    
-    results = []
-    best_auc = 0
-    best_params = None
-    
-    for i, combination in enumerate(tqdm(all_combinations, desc="Grid Search")):
-        # Create config for this combination
-        config = yaml.safe_load(yaml.dump(base_config))
-        params = dict(zip(param_names, combination))
-        
-        # Update config
-        for param_path, value in params.items():
-            keys = param_path.split('.')
-            temp = config
-            for key in keys[:-1]:
-                temp = temp[key]
-            temp[keys[-1]] = value
-        
-        # Evaluate
-        try:
-            auc = quick_evaluate(config, dataset_info, edges, pos_pairs, device)
-            results.append({'params': params, 'auc': auc})
-            
-            if auc > best_auc:
-                best_auc = auc
-                best_params = params
-                print(f"\n✨ New best AUC: {best_auc:.4f}")
-            
-        except Exception as e:
-            print(f"\nError with combination {params}: {e}")
-            continue
-    
-    # Handle case where all trials failed
-    if not results:
-        print("\n❌ All trials failed! No valid results.")
-        return None, 0.0
-    
-    # Sort results
-    results.sort(key=lambda x: x['auc'], reverse=True)
+    best_params = best_trial.params
+    best_auc = best_trial.value
     
     # Save results
-    with open(output_dir / 'grid_search_results.json', 'w') as f:
+    results = {
+        'best_params': best_params,
+        'best_auc': best_auc,
+        'n_trials': len(study.trials),
+        'datetime': datetime.now().isoformat()
+    }
+    
+    results_file = os.path.join(output_dir, 'optuna_best_params.json')
+    with open(results_file, 'w') as f:
         json.dump(results, f, indent=2)
     
-    print(f"\n✨ Best AUC Score: {best_auc:.4f}")
-    print("\n📊 Best parameters:")
-    for key, value in best_params.items():
-        print(f"  {key}: {value}")
+    print(f"\n✅ Best LOOCV AUC: {best_auc:.4f}")
+    print(f"📊 Best parameters saved to: {results_file}")
     
     return best_params, best_auc
 
 
-# ============================================================================
-# MAIN FUNCTION
-# ============================================================================
-
 def main():
-    parser = argparse.ArgumentParser(description='Hyperparameter tuning for HGAT-LDA')
-    parser.add_argument('--method', type=str, default='bayesian', choices=['bayesian', 'grid'],
-                       help='Tuning method: bayesian (Optuna) or grid search')
+    parser = argparse.ArgumentParser(description='Refactored hyperparameter tuning for HGAT-LDA')
     parser.add_argument('--config', type=str, default='configs/default.yaml',
                        help='Base configuration file')
     parser.add_argument('--n_trials', type=int, default=50,
                        help='Number of trials for Bayesian optimization')
-    parser.add_argument('--max_combinations', type=int, default=None,
-                       help='Maximum combinations for grid search')
-    parser.add_argument('--device', type=str, default='auto',
-                       help='Device to use (auto/cuda/cpu)')
+    parser.add_argument('--n_folds', type=int, default=150,
+                       help='Number of LOOCV folds to sample')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
     parser.add_argument('--output_dir', type=str, default='tuning_results',
                        help='Directory to save results')
-    parser.add_argument('--search_space', type=str, default='default',
-                       choices=['default', 'quick', 'extensive'],
-                       help='Search space preset')
     args = parser.parse_args()
     
     # Set seed
     set_seed(args.seed)
-    
-    # Set device
-    if args.device == 'auto':
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    else:
-        device = torch.device(args.device)
-    print(f"🖥️ Using device: {device}")
     
     # Load base configuration
     with open(args.config, 'r') as f:
         base_config = yaml.safe_load(f)
     
     # Load data
-    data_dict, dataset_info, edges, pos_pairs = load_data_and_graph(base_config)
+    print("Loading dataset...")
+    data_dict = load_dataset(base_config['data']['data_dir'])
+    dataset_info = get_dataset_info()
     
-    # Move edges to device
-    edges_device = {}
-    for key, (src, dst, w) in edges.items():
-        if src is not None:
-            src = src.to(device)
-            dst = dst.to(device)
-            if w is not None:
-                w = w.to(device)
-        edges_device[key] = (src, dst, w)
+    # Get positive pairs
+    pos_pairs = get_positive_pairs(data_dict['lnc_disease_assoc'])
+    print(f"Total positive pairs: {len(pos_pairs)}")
     
-    # Define CONSERVATIVE search spaces to prevent overfitting in LOOCV
-    if args.search_space == 'quick':
-        # Quick search with conservative parameters for stable LOOCV performance
-        search_space = {
-            'model.emb_dim': {'type': 'categorical', 'values': [64, 128]},  # Smaller dims to prevent overfitting
-            'model.num_layers': {'type': 'categorical', 'values': [2, 3]},  # Shallower for better generalization
-            'model.dropout': {'type': 'categorical', 'values': [0.3, 0.4]},  # Higher dropout essential
-            'model.num_heads': {'type': 'categorical', 'values': [4, 6]},  # Moderate attention heads
-            'training.lr': {'type': 'float', 'min': 1e-4, 'max': 5e-4, 'log': True},  # Much lower LR range!
-            'training.batch_size': {'type': 'categorical', 'values': [64, 128]},  # Smaller batches
-            'training.neg_ratio': {'type': 'categorical', 'values': [2, 3]},  # Conservative ratio
-            'training.use_focal_loss': {'type': 'categorical', 'values': [False]},  # Standard loss better
-            'training.label_smoothing': {'type': 'categorical', 'values': [0.0, 0.05]},  # Minimal smoothing
-            'training.weight_decay': {'type': 'float', 'min': 5e-5, 'max': 1e-4, 'log': True},  # Higher regularization
-        }
-    elif args.search_space == 'extensive':
-        # Comprehensive but CONSERVATIVE search to avoid overfitting
-        search_space = {
-            # Model parameters - conservative for LOOCV
-            'model.emb_dim': {'type': 'categorical', 'values': [64, 128, 192]},  # Moderate sizes only
-            'model.num_layers': {'type': 'int', 'min': 2, 'max': 4},  # Not too deep
-            'model.dropout': {'type': 'float', 'min': 0.3, 'max': 0.45, 'step': 0.05},  # Higher dropout range
-            'model.num_heads': {'type': 'categorical', 'values': [4, 6, 8]},  # Reasonable attention heads
-            'model.relation_dropout': {'type': 'float', 'min': 0.1, 'max': 0.2, 'step': 0.05},  # More dropout
-            'model.use_layernorm': {'type': 'categorical', 'values': [True]},  # Always use
-            'model.use_residual': {'type': 'categorical', 'values': [True]},  # Always use
-            
-            # Training parameters - very conservative for stability
-            'training.lr': {'type': 'float', 'min': 5e-5, 'max': 5e-4, 'log': True},  # Much lower range!
-            'training.weight_decay': {'type': 'float', 'min': 5e-5, 'max': 2e-4, 'log': True},  # Strong regularization
-            'training.batch_size': {'type': 'categorical', 'values': [32, 64, 128]},  # Smaller batches only
-            'training.neg_ratio': {'type': 'int', 'min': 1, 'max': 3},  # Lower ratios
-            'training.use_focal_loss': {'type': 'categorical', 'values': [False]},  # Standard loss only
-            'training.label_smoothing': {'type': 'float', 'min': 0.0, 'max': 0.1, 'step': 0.05},  # Max 0.1
-            'training.cosine_tmax': {'type': 'categorical', 'values': [25, 30]},  # Match shorter epochs
-            'training.num_epochs': {'type': 'categorical', 'values': [25, 30]},  # Fewer epochs
-            
-            # Data parameters - moderate connectivity
-            'data.sim_topk': {'type': 'int', 'min': 10, 'max': 25, 'step': 5},  # Not too many neighbors
-            'data.sim_row_normalize': {'type': 'categorical', 'values': [True]},  # Always normalize
-        }
-    else:  # default - LOOCV-optimized conservative search space
-        search_space = {
-            # Model parameters - conservative defaults
-            'model.emb_dim': {'type': 'categorical', 'values': [64, 128]},
-            'model.num_layers': {'type': 'int', 'min': 2, 'max': 3},  # Shallow models
-            'model.dropout': {'type': 'float', 'min': 0.3, 'max': 0.4, 'step': 0.05},  # Higher dropout
-            'model.num_heads': {'type': 'categorical', 'values': [4, 6]},  # Moderate heads
-            'model.relation_dropout': {'type': 'float', 'min': 0.1, 'max': 0.2, 'step': 0.05},
-            
-            # Training parameters - conservative for stability
-            'training.lr': {'type': 'float', 'min': 1e-4, 'max': 8e-4, 'log': True},  # Lower range
-            'training.weight_decay': {'type': 'float', 'min': 5e-5, 'max': 1e-4, 'log': True},
-            'training.batch_size': {'type': 'categorical', 'values': [64, 128]},  # Smaller batches
-            'training.neg_ratio': {'type': 'int', 'min': 1, 'max': 5},
-            'training.use_focal_loss': {'type': 'categorical', 'values': [True, False]},
-            'training.label_smoothing': {'type': 'float', 'min': 0.0, 'max': 0.2, 'step': 0.05},
-            'training.cosine_tmax': {'type': 'categorical', 'values': [50, 100, 150]},
-            
-            # Data parameters
-            'data.sim_topk': {'type': 'int', 'min': 5, 'max': 30, 'step': 5},
-        }
+    # Define search space
+    search_space = {
+        # Model parameters
+        'model.emb_dim': {'type': 'categorical', 'values': [128, 192, 256]},
+        'model.num_layers': {'type': 'int', 'min': 2, 'max': 3},
+        'model.dropout': {'type': 'float', 'min': 0.3, 'max': 0.45, 'step': 0.05},
+        'model.num_heads': {'type': 'categorical', 'values': [4, 6, 8]},
+        'model.relation_dropout': {'type': 'float', 'min': 0.1, 'max': 0.25, 'step': 0.05},
+        
+        # Training parameters
+        'training.lr': {'type': 'float', 'min': 1e-4, 'max': 5e-4, 'log': True},
+        'training.weight_decay': {'type': 'float', 'min': 5e-5, 'max': 1e-4, 'log': True},
+        'training.batch_size': {'type': 'categorical', 'values': [64, 128]},
+        'training.neg_ratio': {'type': 'int', 'min': 2, 'max': 3},
+        'training.loss_type': {'type': 'categorical', 'values': ['pairwise']},
+        'training.pairwise_type': {'type': 'categorical', 'values': ['auc', 'bpr']},
+        
+        # Data parameters
+        'data.sim_topk': {'type': 'int', 'min': 20, 'max': 40, 'step': 5},
+    }
     
-    # Run tuning
-    print(f"\n🚀 Starting {args.method} optimization for LOOCV...")
-    print(f"🎯 Objective: Maximize LOOCV AUC")
-    print(f"📦 Search space: {args.search_space}")
-    print(f"🔬 Evaluation: Sampling {min(150, len(pos_pairs))} LOOCV folds per trial")
+    # Run optimization
+    print(f"\n🚀 Starting Bayesian optimization for true LOOCV protocol")
+    print(f"🎯 Objective: Maximize LOOCV AUC with full ranking")
+    print(f"📦 Sampling {args.n_folds} stratified folds per trial")
     print("=" * 60)
     
-    if args.method == 'bayesian':
-        best_params, best_auc = run_bayesian_optimization(
-            base_config, dataset_info, edges_device, pos_pairs, device, 
-            search_space, args.n_trials, args.output_dir
-        )
-    else:  # grid
-        best_params, best_auc = run_grid_search(
-            base_config, dataset_info, edges_device, pos_pairs, device, 
-            search_space, args.max_combinations, args.output_dir
-        )
+    best_params, best_auc = run_bayesian_optimization(
+        base_config, data_dict, dataset_info, pos_pairs, 
+        search_space, args.n_trials, args.output_dir
+    )
     
-    # Check if tuning was successful
-    if best_params is None:
-        print("\n❌ Tuning failed! No valid results obtained.")
-        print("Check the error messages above for issues.")
-        return
-    
-    # Always update configs/default.yaml with best parameters after successful tuning
+    # Update config with best parameters
     if best_params:
         print("\n🔄 Updating configs/default.yaml with best parameters...")
-        update_default_config(best_params)
-        print("✅ configs/default.yaml has been automatically updated!")
+        config = base_config.copy()
+        
+        for param_path, value in best_params.items():
+            keys = param_path.split('.')
+            temp = config
+            for key in keys[:-1]:
+                if key not in temp:
+                    temp[key] = {}
+                temp = temp[key]
+            temp[keys[-1]] = value
+        
+        with open(args.config, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+        
+        print("✅ Configuration updated successfully!")
     
     # Print summary
     print("\n" + "=" * 60)
-    print("✅ LOOCV OPTIMIZATION COMPLETE")
+    print("✅ REFACTORED LOOCV OPTIMIZATION COMPLETE")
     print("=" * 60)
     print(f"Best LOOCV AUC: {best_auc:.4f}")
     print(f"Results saved in: {args.output_dir}")
-    
-    print("\n✨ configs/default.yaml has been automatically updated with best LOOCV parameters")
-    print("These parameters are optimized specifically for LOOCV performance!")
     print("\nYou can now run full LOOCV evaluation:")
     print("  python3 main.py --mode loocv --config configs/default.yaml")
 

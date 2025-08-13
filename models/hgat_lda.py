@@ -28,6 +28,7 @@ class HGAT_LDA(nn.Module):
                  relation_dropout: float = 0.1,
                  use_layernorm: bool = True,
                  use_residual: bool = True,
+                 use_relation_norm: bool = True,
                  init_from_similarity: Optional[Dict[str, torch.Tensor]] = None):
         """
         Initialize the HGAT-LDA model.
@@ -44,6 +45,7 @@ class HGAT_LDA(nn.Module):
             relation_dropout: Relation-level dropout probability
             use_layernorm: Whether to apply LayerNorm in layers
             use_residual: Whether to use residual connections
+            use_relation_norm: Whether to use relation-level normalization (D^-1 A)
             init_from_similarity: Optional dict with keys 'lncRNA','gene','disease' tensors for init
         """
         super(HGAT_LDA, self).__init__()
@@ -83,7 +85,8 @@ class HGAT_LDA(nn.Module):
                 num_heads=num_heads,
                 relation_dropout=relation_dropout,
                 use_layernorm=use_layernorm,
-                use_residual=use_residual
+                use_residual=use_residual,
+                use_relation_norm=use_relation_norm
             )
             for _ in range(num_layers)
         ])

@@ -1,37 +1,63 @@
+# configs/default.yaml — HeRALD (HGAT-LDA) — LOOCV/AUC-optimized
+
 model:
-  emb_dim: 256               # Updated per tuning
-  num_layers: 4              # Updated per tuning
-  dropout: 0.35              # Updated per tuning
-  num_heads: 6               # Updated per tuning
-  relation_dropout: 0.1      # Updated per tuning
-  use_layernorm: true        # Use LayerNorm for stable training
-  use_residual: true         # Use residual connections
+  emb_dim: 256
+  num_layers: 3              # shallower = less over-smoothing on small graphs
+  dropout: 0.35
+  num_heads: 4               # 256 % 4 == 0  → head_dim=64
+  relation_dropout: 0.2      # a bit more regularization for stability
+  use_layernorm: true
+  use_residual: true
+  use_relation_norm: true    # normalize per relation (D^-1 A)
 
 training:
-  lr: 0.0003762875402329099  # Updated per tuning
-  weight_decay: 7.438974554514027e-05  # Updated per tuning
-  batch_size: 128             # Updated per tuning
-  num_epochs: 50              # Keep as is unless tuned separately
-  val_split: 0.15             # Standard validation split
-  early_stopping_patience: 10 # Reasonable patience
-  neg_ratio: 3                # Updated per tuning
-  cosine_tmax: 50             # Updated per tuning
-  use_focal_loss: false       # Updated per tuning
-  label_smoothing: 0.05       # Updated per tuning
-  gradient_clip: 1.0          # Gradient clipping for stability
+  # Optimizer/schedule
+  lr: 0.00038
+  weight_decay: 7.44e-05
+  batch_size: 128
+  num_epochs: 30             # align with cosine_tmax
+  cosine_tmax: 30
 
+  # Loss (AUC-first)
+  loss_type: pairwise        # pairwise | bce | focal
+  pairwise_type: auc         # auc (logistic) | bpr
+  use_hard_negatives: true   # semi-hard mining inside trainer
+  label_smoothing: 0.0       # do not smooth for pairwise
+
+  # BCE fallback settings (kept for compatibility; ignored in pairwise)
+  use_focal_loss: false
+  neg_ratio: 3
+
+  # General stability
+  gradient_clip: 1.0
+  val_split: 0.0             # LOOCV per-fold; no random val split
+  early_stopping_patience: 0 # not used with val_split=0
 
 data:
+  data_dir: Dataset
   threshold: 0.0
   symmetric: true
-  data_dir: Dataset
-  sim_row_normalize: true     # Normalize similarity matrices
-  sim_topk: 30                # Keep top-30 neighbors (sweet spot)
+
+  # Similarity graph hygiene
+  sim_topk: 30               # try 20/30/40 if you sweep
+  sim_mutual: true           # mutual-kNN (bidirectional)
+  sim_sym: true              # symmetrize after filtering
+  sim_row_norm: true         # row-stochastic
+  sim_row_normalize: true    # legacy key (kept true for safety)
+  sim_tau: null              # optional softmax temperature (e.g., 0.8)
+
+  # Bipartite relations
+  use_bipartite_edge_weight: true  # tf-idf/degree-style weights
+
+eval:
+  protocol: loocv_pair       # per-positive LOOCV
+  rewrite_isolated: true     # rewrite disease row/col when isolated
+  full_ranking: true         # rank all candidates (no neg sampling)
 
 system:
-  device: auto                # Device: auto, cuda, cpu
-  seed: 42                    # Random seed
-  num_workers: 32             # Many workers for 64-core CPU
-  use_amp: true               # Enable AMP for RTX 5090
-  pin_memory: true            # Pin memory for faster GPU transfer
-  prefetch_factor: 4          # Prefetch batches for efficiency
+  device: auto
+  seed: 42
+  num_workers: 8             # safer default; raise if your loader is stable
+  use_amp: true
+  pin_memory: true
+  prefetch_factor: 4

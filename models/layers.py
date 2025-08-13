@@ -21,7 +21,8 @@ class HeterogeneousGNNLayer(nn.Module):
                  num_heads: int = 4,
                  relation_dropout: float = 0.0,
                  use_layernorm: bool = True,
-                 use_residual: bool = True):
+                 use_residual: bool = True,
+                 use_relation_norm: bool = True):
         """
         Initialize the heterogeneous GNN layer.
         
@@ -33,6 +34,7 @@ class HeterogeneousGNNLayer(nn.Module):
             relation_dropout: Probability to drop an incoming relation's message
             use_layernorm: Whether to apply LayerNorm after update
             use_residual: Whether to add residual connection from input
+            use_relation_norm: Whether to apply degree normalization per relation (D^-1 A style)
         """
         super(HeterogeneousGNNLayer, self).__init__()
         self.emb_dim = emb_dim
@@ -41,6 +43,7 @@ class HeterogeneousGNNLayer(nn.Module):
         self.relation_dropout = relation_dropout
         self.use_layernorm = use_layernorm
         self.use_residual = use_residual
+        self.use_relation_norm = use_relation_norm
         
         # Relation-specific weight matrices
         self.W_rel = nn.ModuleDict()
@@ -125,19 +128,30 @@ class HeterogeneousGNNLayer(nn.Module):
                 rel_message_dict[key] = torch.zeros_like(new_h[dst_type])
             rel_message_dict[key].index_add_(0, dst_idx, m.to(rel_message_dict[key].dtype))
         
-        # Normalize by degree for each relation
-        for (src_type, rel_name, dst_type), (src_idx, dst_idx, w) in edges.items():
-            if src_idx is None:
-                continue
-            num_dst = new_h[dst_type].shape[0]
-            dst_idx = dst_idx.to(new_h[dst_type].device)
-            deg = torch.zeros(num_dst, device=new_h[dst_type].device)
-            ones = torch.ones_like(dst_idx, dtype=torch.float)
-            deg.index_add_(0, dst_idx, ones)
-            deg[deg == 0] = 1.0  # Avoid division by zero
-            
-            rel_msg = rel_message_dict[(src_type, rel_name, dst_type)]
-            rel_message_dict[(src_type, rel_name, dst_type)] = rel_msg / deg.unsqueeze(-1)
+        # Normalize by degree for each relation (D^-1 A style normalization)
+        if self.use_relation_norm:
+            for (src_type, rel_name, dst_type), (src_idx, dst_idx, w) in edges.items():
+                if src_idx is None:
+                    continue
+                num_dst = new_h[dst_type].shape[0]
+                dst_idx = dst_idx.to(new_h[dst_type].device)
+                
+                # Compute degree for this specific relation
+                deg = torch.zeros(num_dst, device=new_h[dst_type].device)
+                if w is not None:
+                    # If edge weights are provided, use weighted degree
+                    w = w.to(dst_idx.device)
+                    deg.index_add_(0, dst_idx, w)
+                else:
+                    # Otherwise use unweighted degree
+                    ones = torch.ones_like(dst_idx, dtype=torch.float)
+                    deg.index_add_(0, dst_idx, ones)
+                
+                deg[deg == 0] = 1.0  # Avoid division by zero
+                
+                # Apply normalization to relation-specific messages
+                rel_msg = rel_message_dict[(src_type, rel_name, dst_type)]
+                rel_message_dict[(src_type, rel_name, dst_type)] = rel_msg / deg.unsqueeze(-1)
         
         # Attention mechanism (multi-head over relation types)
         att_new_h = {t: torch.zeros_like(h) for t, h in new_h.items()}

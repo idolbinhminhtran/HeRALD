@@ -6,13 +6,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 import numpy as np
 from tqdm import tqdm
 import os
 
 from models.hgat_lda import HGAT_LDA
 from data.graph_construction import get_positive_pairs, generate_negative_pairs
+from models.losses import get_loss_function, compute_hard_negatives, FocalLoss as FocalLossNew
 
 
 class FocalLoss(nn.Module):
@@ -51,7 +52,11 @@ class HGATLDATrainer:
                  use_amp: bool = True,
                  use_focal_loss: bool = True,
                  label_smoothing: float = 0.1,
-                 use_multi_gpu: bool = True):
+                 use_multi_gpu: bool = True,
+                 full_ranking_eval: bool = True,
+                 loss_type: str = 'bce',
+                 pairwise_type: str = 'bpr',
+                 use_hard_negatives: bool = True):
         """
         Initialize the trainer with optional multi-GPU support.
         
@@ -66,6 +71,10 @@ class HGATLDATrainer:
             cosine_tmax: If provided, use CosineAnnealingLR with T_max
             use_amp: Whether to use automatic mixed precision (AMP) for training
             use_multi_gpu: Whether to use DataParallel for multi-GPU training
+            full_ranking_eval: Whether to use full ranking for validation (evaluates all negatives)
+            loss_type: Type of loss ('bce', 'focal', 'pairwise')
+            pairwise_type: Type of pairwise loss ('bpr' or 'auc') when loss_type='pairwise'
+            use_hard_negatives: Whether to use hard negative mining for pairwise losses
         """
         # Move model to device first
         self.model = model.to(device)
@@ -83,15 +92,34 @@ class HGATLDATrainer:
         self.neg_ratio = max(1, neg_ratio)
         self.use_amp = use_amp and torch.cuda.is_available()
         self.label_smoothing = label_smoothing
+        self.full_ranking_eval = full_ranking_eval
+        self.loss_type = loss_type.lower()
+        self.pairwise_type = pairwise_type.lower()
+        self.use_hard_negatives = use_hard_negatives
         
         # Optimizer with improved settings
         self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.999))
         
-        # Loss function - use focal loss for imbalanced data
-        if use_focal_loss:
-            self.criterion = FocalLoss(alpha=0.25, gamma=2.0)
-        else:
+        # Loss function configuration based on loss_type
+        if self.loss_type == 'pairwise':
+            # Use pairwise ranking loss
+            self.criterion = get_loss_function('pairwise', pairwise_type=self.pairwise_type)
+            self.is_pairwise = True
+            if enable_progress:
+                print(f"   Using pairwise {self.pairwise_type.upper()} loss with {'hard' if use_hard_negatives else 'random'} negatives")
+        elif self.loss_type == 'focal':
+            self.criterion = get_loss_function('focal', alpha=0.25, gamma=2.0)
+            self.is_pairwise = False
+        elif self.loss_type == 'bce':
             self.criterion = nn.BCEWithLogitsLoss()
+            self.is_pairwise = False
+        else:
+            # Backward compatibility: use_focal_loss parameter
+            if use_focal_loss:
+                self.criterion = get_loss_function('focal', alpha=0.25, gamma=2.0)
+            else:
+                self.criterion = nn.BCEWithLogitsLoss()
+            self.is_pairwise = False
             
         # Mixed precision scaler
         if torch.cuda.is_available() and self.use_amp:
@@ -125,10 +153,18 @@ class HGATLDATrainer:
             edges_device[key] = (src, dst, w)
         return edges_device
     
-    def train_epoch(self, pos_pairs: torch.Tensor, neg_pairs_all: torch.Tensor, edges: Dict) -> float:
+    def train_epoch(self, pos_pairs: torch.Tensor, neg_pairs_all: torch.Tensor, edges: Dict) -> Tuple[float, Optional[Dict]]:
+        """
+        Train for one epoch.
+        
+        Returns:
+            Tuple of (average_loss, metrics_dict)
+        """
         self.model.train()
         epoch_loss = 0.0
         num_batches = 0
+        pos_scores_list = []
+        neg_scores_list = []
         
         edges_device = self._move_edges_to_device(edges)
         perm = torch.randperm(pos_pairs.size(0))
@@ -142,27 +178,124 @@ class HGATLDATrainer:
         for start in batch_iterator:
             end = min(start + pos_per_batch, pos_pairs.size(0))
             batch_pos = pos_pairs[start:end]
-            # Sample negatives according to ratio
-            neg_indices = torch.randint(0, neg_pairs_all.size(0), (batch_pos.size(0) * self.neg_ratio,))
-            batch_neg = neg_pairs_all[neg_indices]
             
-            batch_all = torch.cat([batch_pos, batch_neg], dim=0)
-            lnc_idx_batch = batch_all[:, 0].to(self.device)
-            dis_idx_batch = batch_all[:, 1].to(self.device)
+            # Get positive indices
+            pos_lnc = batch_pos[:, 0].to(self.device)
+            pos_dis = batch_pos[:, 1].to(self.device)
             
-            # Create labels with label smoothing
-            pos_labels = torch.ones(batch_pos.size(0)) * (1.0 - self.label_smoothing)
-            neg_labels = torch.zeros(batch_neg.size(0)) + self.label_smoothing
-            labels = torch.cat([pos_labels, neg_labels], dim=0).to(self.device)
-            
-            # Use the new autocast API if AMP is enabled
-            if self.use_amp:
-                with torch.cuda.amp.autocast(enabled=True):
+            if self.is_pairwise:
+                # For pairwise losses, handle differently
+                
+                # Sample or mine hard negatives
+                if self.use_hard_negatives and len(neg_pairs_all) > 0:
+                    # Mine hard negatives
+                    neg_lnc_pool = neg_pairs_all[:, 0].to(self.device)
+                    neg_dis_pool = neg_pairs_all[:, 1].to(self.device)
+                    
+                    # Get unique diseases in this batch
+                    unique_dis = torch.unique(pos_dis)
+                    hard_neg_lnc = []
+                    hard_neg_dis = []
+                    
+                    with torch.no_grad():
+                        self.model.eval()  # Set to eval mode for hard negative mining
+                        for d in unique_dis:
+                            # Find negatives for this disease
+                            mask = pos_dis == d
+                            if mask.sum() == 0:
+                                continue
+                            
+                            # Get negative lncRNAs for this disease
+                            neg_mask = neg_dis_pool == d
+                            if neg_mask.sum() > 0:
+                                neg_lncs_for_d = neg_lnc_pool[neg_mask]
+                                
+                                # Score all negative lncRNAs in batches to avoid BN issues
+                                if len(neg_lncs_for_d) > 1:
+                                    d_repeated = d.repeat(len(neg_lncs_for_d))
+                                    neg_scores = self.model(neg_lncs_for_d, d_repeated, edges_device)
+                                    
+                                    # Select hardest negatives (highest scores)
+                                    k = min(mask.sum().item(), len(neg_scores))
+                                    _, hard_idx = torch.topk(neg_scores, k)
+                                    
+                                    hard_neg_lnc.append(neg_lncs_for_d[hard_idx])
+                                    hard_neg_dis.append(d_repeated[hard_idx])
+                        self.model.train()  # Set back to train mode
+                    
+                    if hard_neg_lnc:
+                        neg_lnc = torch.cat(hard_neg_lnc)
+                        neg_dis = torch.cat(hard_neg_dis)
+                        # Ensure same number of positives and negatives for pairwise loss
+                        if len(neg_lnc) < len(pos_lnc):
+                            # Need more negatives, sample randomly
+                            num_needed = len(pos_lnc) - len(neg_lnc)
+                            extra_indices = torch.randint(0, neg_pairs_all.size(0), (num_needed,))
+                            extra_neg = neg_pairs_all[extra_indices]
+                            neg_lnc = torch.cat([neg_lnc, extra_neg[:, 0].to(self.device)])
+                            neg_dis = torch.cat([neg_dis, extra_neg[:, 1].to(self.device)])
+                        elif len(neg_lnc) > len(pos_lnc):
+                            # Too many negatives, truncate to match positives
+                            neg_lnc = neg_lnc[:len(pos_lnc)]
+                            neg_dis = neg_dis[:len(pos_dis)]
+                    else:
+                        # Fallback to random sampling
+                        neg_indices = torch.randint(0, neg_pairs_all.size(0), (len(batch_pos),))
+                        batch_neg = neg_pairs_all[neg_indices]
+                        neg_lnc = batch_neg[:, 0].to(self.device)
+                        neg_dis = batch_neg[:, 1].to(self.device)
+                else:
+                    # Random negative sampling
+                    neg_indices = torch.randint(0, neg_pairs_all.size(0), (len(batch_pos),))
+                    batch_neg = neg_pairs_all[neg_indices]
+                    neg_lnc = batch_neg[:, 0].to(self.device)
+                    neg_dis = batch_neg[:, 1].to(self.device)
+                
+                # Compute scores for pairwise loss
+                if self.use_amp:
+                    with torch.cuda.amp.autocast(enabled=True):
+                        pos_scores = self.model(pos_lnc, pos_dis, edges_device)
+                        neg_scores = self.model(neg_lnc, neg_dis, edges_device)
+                        loss = self.criterion(pos_scores, neg_scores)
+                else:
+                    pos_scores = self.model(pos_lnc, pos_dis, edges_device)
+                    neg_scores = self.model(neg_lnc, neg_dis, edges_device)
+                    loss = self.criterion(pos_scores, neg_scores)
+                
+                # Track scores for metrics
+                pos_scores_list.append(pos_scores.detach().mean().item())
+                neg_scores_list.append(neg_scores.detach().mean().item())
+                
+            else:
+                # Standard BCE/Focal loss
+                # Sample negatives according to ratio
+                neg_indices = torch.randint(0, neg_pairs_all.size(0), (batch_pos.size(0) * self.neg_ratio,))
+                batch_neg = neg_pairs_all[neg_indices]
+                
+                batch_all = torch.cat([batch_pos, batch_neg], dim=0)
+                lnc_idx_batch = batch_all[:, 0].to(self.device)
+                dis_idx_batch = batch_all[:, 1].to(self.device)
+                
+                # Create labels with label smoothing
+                pos_labels = torch.ones(batch_pos.size(0)) * (1.0 - self.label_smoothing)
+                neg_labels = torch.zeros(batch_neg.size(0)) + self.label_smoothing
+                labels = torch.cat([pos_labels, neg_labels], dim=0).to(self.device)
+                
+                # Use the new autocast API if AMP is enabled
+                if self.use_amp:
+                    with torch.cuda.amp.autocast(enabled=True):
+                        logits = self.model(lnc_idx_batch, dis_idx_batch, edges_device)
+                        loss = self.criterion(logits, labels)
+                else:
                     logits = self.model(lnc_idx_batch, dis_idx_batch, edges_device)
                     loss = self.criterion(logits, labels)
-            else:
-                logits = self.model(lnc_idx_batch, dis_idx_batch, edges_device)
-                loss = self.criterion(logits, labels)
+                
+                # Track scores for metrics
+                with torch.no_grad():
+                    pos_logits = logits[:batch_pos.size(0)]
+                    neg_logits = logits[batch_pos.size(0):]
+                    pos_scores_list.append(pos_logits.mean().item())
+                    neg_scores_list.append(neg_logits.mean().item())
             
             self.optimizer.zero_grad()
             if self.scaler is not None:
@@ -178,7 +311,16 @@ class HGATLDATrainer:
             epoch_loss += loss.item()
             num_batches += 1
         
-        return epoch_loss / max(num_batches, 1)
+        # Compute metrics
+        metrics = None
+        if pos_scores_list and neg_scores_list:
+            metrics = {
+                'pos_score_mean': np.mean(pos_scores_list),
+                'neg_score_mean': np.mean(neg_scores_list),
+                'score_gap': np.mean(pos_scores_list) - np.mean(neg_scores_list)
+            }
+        
+        return epoch_loss / max(num_batches, 1), metrics
     
     def train(self, 
              pos_pairs: torch.Tensor,
@@ -207,7 +349,7 @@ class HGATLDATrainer:
         patience_counter = 0
         
         for epoch in range(1, num_epochs + 1):
-            train_loss = self.train_epoch(train_pos, neg_pairs_all, edges)
+            train_loss, train_metrics = self.train_epoch(train_pos, neg_pairs_all, edges)
             self.train_losses.append(train_loss)
             val_loss = self.validate(val_pos, neg_pairs_all, edges)
             self.val_losses.append(val_loss)
@@ -216,6 +358,10 @@ class HGATLDATrainer:
                 print(f"Epoch {epoch}/{num_epochs}")
                 print(f"  Train Loss: {train_loss:.4f}")
                 print(f"  Val Loss: {val_loss:.4f}")
+                if train_metrics and self.is_pairwise:
+                    print(f"  Pos Score: {train_metrics['pos_score_mean']:.4f}, "
+                          f"Neg Score: {train_metrics['neg_score_mean']:.4f}, "
+                          f"Gap: {train_metrics['score_gap']:.4f}")
             
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
