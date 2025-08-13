@@ -39,12 +39,25 @@ def canonical_affinity(raw_scores: torch.Tensor,
         return -raw_scores
     
     if orientation == "auto":
-        # In auto mode, sign_override should always be provided after calibration
-        # If not provided, return raw scores with a warning
-        print("⚠️ Warning: auto mode without sign_override, returning raw scores")
-        return raw_scores
+        # In auto mode, sign_override must be provided after calibration
+        raise ValueError("auto orientation requires score_sign to be calibrated; got None")
     
     raise ValueError(f"model.score_orientation must be affinity|distance|auto, got {orientation}")
+
+
+def require_sign(orientation: str, sign: Optional[float]) -> None:
+    """
+    Require score_sign when orientation is 'auto'.
+    
+    Args:
+        orientation: Score orientation mode
+        sign: Score sign multiplier
+        
+    Raises:
+        ValueError: If orientation is 'auto' and sign is None
+    """
+    if orientation == "auto" and sign is None:
+        raise ValueError("auto orientation requires score_sign to be calibrated; got None")
 
 
 def calibrate_score_sign(pos_scores: torch.Tensor, 

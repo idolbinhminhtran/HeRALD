@@ -12,7 +12,7 @@ import time
 from models.hgat_lda import HGAT_LDA
 from training.trainer import HGATLDATrainer
 from data.graph_construction import get_positive_pairs, generate_negative_pairs, rewrite_ld_for_isolated_diseases, construct_heterogeneous_graph
-from utils.scoring import canonical_affinity
+from utils.scoring import canonical_affinity, require_sign
 
 
 class HGATLDAEvaluator:
@@ -527,6 +527,7 @@ class HGATLDAEvaluator:
         print(f"\n{'='*70}")
         print(f"Starting LOOCV with rewrite for {num_folds} positive pairs")
         print(f"Evaluation settings: neg_sampling=False, full_ranking={full_ranking}")
+        print(f"Scoring: orientation={self.score_orientation}, score_sign=will be calibrated per fold")
         print(f"Disease rewrite enabled: {rewrite_isolated}")
         print(f"Training {num_epochs} epochs per fold (neg_ratio={neg_ratio} for training only)")
         print(f"{'='*70}")
@@ -625,12 +626,10 @@ class HGATLDAEvaluator:
                 save_path=None
             )
             
-            # Get calibrated score_sign from trainer (if not already set)
-            if self.score_sign is None and trainer.score_sign is not None:
-                self.score_sign = trainer.score_sign
-                if fold_idx == 0:  # Print calibration info on first fold
-                    print(f"[Score Calibration] orientation={self.score_orientation}, "
-                          f"score_sign={'+1' if self.score_sign > 0 else '-1'}")
+            # Get calibrated score_sign from trainer
+            fold_score_sign = trainer.get_score_sign()
+            if fold_score_sign is not None:
+                self.score_sign = fold_score_sign
             
             # Full-ranking evaluation with proper masking
             model_fold.eval()
@@ -639,6 +638,7 @@ class HGATLDAEvaluator:
             raw_scores = self.score_all_lnc(model_fold, test_dis, fold_edges_device, num_lncRNAs)  # [L]
             
             # Convert to canonical affinity scores (higher = better)
+            require_sign(self.score_orientation, self.score_sign)
             aff_scores = canonical_affinity(raw_scores, self.score_orientation, self.score_sign)
             
             # Create mask for known positives (from original data, not just training)
@@ -694,9 +694,11 @@ class HGATLDAEvaluator:
                 mean_f1 = np.mean([r['f1_max'] for r in fold_results])
                 
                 # Compact single-line output for each fold with diagnostics
+                sign_str = '+1' if self.score_sign and self.score_sign > 0 else '-1' if self.score_sign else 'None'
                 print(f"Fold {fold_idx+1:4d}/{num_folds}: "
                       f"AUC={fold_auc:.3f} (mean={mean_auc:.3f}), "
                       f"rank={rank:3d}, "
+                      f"sign={sign_str}, "
                       f"edge={removed_edge_present}, "
                       f"ld_edges={ld_edge_count}/855 "
                       f"{'[R]' if disease_was_rewritten else ''}")

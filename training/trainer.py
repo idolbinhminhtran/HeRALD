@@ -14,7 +14,7 @@ import os
 from models.hgat_lda import HGAT_LDA
 from data.graph_construction import get_positive_pairs, generate_negative_pairs
 from models.losses import get_loss_function, compute_hard_negatives, FocalLoss as FocalLossNew
-from utils.scoring import canonical_affinity, calibrate_score_sign
+from utils.scoring import canonical_affinity, calibrate_score_sign, require_sign
 
 
 class FocalLoss(nn.Module):
@@ -159,6 +159,87 @@ class HGATLDATrainer:
             edges_device[key] = (src, dst, w)
         return edges_device
     
+    def calibrate_score_sign(self, pos_pairs: torch.Tensor, neg_pairs_all: torch.Tensor, 
+                             edges: Dict, batch_size: int = 256) -> None:
+        """
+        Calibrate score sign by comparing positive and negative scores.
+        
+        Args:
+            pos_pairs: Positive training pairs
+            neg_pairs_all: All negative pairs
+            edges: Graph edges
+            batch_size: Batch size for calibration
+        """
+        if self.score_orientation != 'auto':
+            # Fixed orientation, no calibration needed
+            return
+        
+        if self.calibrated:
+            # Already calibrated
+            return
+        
+        self.model.eval()
+        edges_device = self._move_edges_to_device(edges)
+        
+        # Sample a small batch for calibration
+        num_samples = min(batch_size, len(pos_pairs))
+        sample_idx = torch.randperm(len(pos_pairs))[:num_samples]
+        sample_pos = pos_pairs[sample_idx]
+        
+        pos_lnc = sample_pos[:, 0].to(self.device)
+        pos_dis = sample_pos[:, 1].to(self.device)
+        
+        # For each positive, find a negative lncRNA for the same disease
+        neg_lnc_list = []
+        neg_dis_list = []
+        
+        # Build set of known positives for masking
+        known_positives = set()
+        for l, d in pos_pairs:
+            known_positives.add((l.item(), d.item()))
+        
+        for i in range(len(pos_dis)):
+            d = pos_dis[i].item()
+            # Find negative lncRNAs for this disease (sample any lncRNA not associated with it)
+            valid_negs = []
+            for lnc_idx in range(472):  # Assuming 472 lncRNAs (should be passed as parameter)
+                if (lnc_idx, d) not in known_positives:
+                    valid_negs.append(lnc_idx)
+            if valid_negs:
+                # Sample one negative randomly
+                neg_lnc = valid_negs[torch.randint(len(valid_negs), (1,)).item()]
+                neg_lnc_list.append(torch.tensor(neg_lnc))
+                neg_dis_list.append(torch.tensor(d))
+        
+        if not neg_lnc_list:
+            print("[Calibration] Warning: Could not find negatives for calibration, using default sign=+1")
+            self.score_sign = 1.0
+            self.calibrated = True
+            return
+        
+        neg_lnc = torch.stack(neg_lnc_list).to(self.device)
+        neg_dis = torch.stack(neg_dis_list).to(self.device)
+        
+        # Compute raw scores (no canonicalization)
+        with torch.no_grad():
+            raw_pos = self.model(pos_lnc[:len(neg_lnc)], pos_dis[:len(neg_dis)], edges_device)
+            raw_neg = self.model(neg_lnc, neg_dis, edges_device)
+        
+        # Determine sign based on mean gap
+        gap = (raw_pos - raw_neg).mean().item()
+        self.score_sign = 1.0 if gap >= 0 else -1.0
+        self.calibrated = True
+        
+        print(f"[Calibration] score_orientation={self.score_orientation}, "
+              f"score_sign={'+1' if self.score_sign > 0 else '-1'}, "
+              f"mean_gap={gap:.4f}")
+        
+        self.model.train()
+    
+    def get_score_sign(self) -> Optional[float]:
+        """Get the calibrated score sign."""
+        return self.score_sign
+    
     def train_epoch(self, pos_pairs: torch.Tensor, neg_pairs_all: torch.Tensor, edges: Dict, 
                    train_pos_pairs: torch.Tensor = None) -> Tuple[float, Optional[Dict]]:
         """
@@ -238,6 +319,7 @@ class HGATLDATrainer:
                                     neg_scores = self.model(neg_lncs_for_d, d_repeated, edges_device)
                                     
                                     # Convert to canonical affinity for hard mining (highest affinity = hardest)
+                                    require_sign(self.score_orientation, self.score_sign)
                                     neg_affinity = canonical_affinity(neg_scores, self.score_orientation, self.score_sign)
                                     
                                     # Select hardest negatives (highest affinity scores)
@@ -282,12 +364,8 @@ class HGATLDATrainer:
                         pos_scores = self.model(pos_lnc, pos_dis, edges_device)
                         neg_scores = self.model(neg_lnc, neg_dis, edges_device)
                         
-                        # Calibrate score sign on first batch if needed
-                        if not self.calibrated and self.score_orientation == 'auto':
-                            self.score_sign = calibrate_score_sign(pos_scores.detach(), neg_scores.detach(), self.score_orientation)
-                            self.calibrated = True
-                        
-                        # Convert to canonical affinity scores
+                        # Convert to canonical affinity scores (sign already calibrated)
+                        require_sign(self.score_orientation, self.score_sign)
                         aff_pos = canonical_affinity(pos_scores, self.score_orientation, self.score_sign)
                         aff_neg = canonical_affinity(neg_scores, self.score_orientation, self.score_sign)
                         
@@ -301,12 +379,8 @@ class HGATLDATrainer:
                     pos_scores = self.model(pos_lnc, pos_dis, edges_device)
                     neg_scores = self.model(neg_lnc, neg_dis, edges_device)
                     
-                    # Calibrate score sign on first batch if needed
-                    if not self.calibrated and self.score_orientation == 'auto':
-                        self.score_sign = calibrate_score_sign(pos_scores.detach(), neg_scores.detach(), self.score_orientation)
-                        self.calibrated = True
-                    
-                    # Convert to canonical affinity scores
+                    # Convert to canonical affinity scores (sign already calibrated)
+                    require_sign(self.score_orientation, self.score_sign)
                     aff_pos = canonical_affinity(pos_scores, self.score_orientation, self.score_sign)
                     aff_neg = canonical_affinity(neg_scores, self.score_orientation, self.score_sign)
                     
@@ -385,6 +459,9 @@ class HGATLDATrainer:
              val_split: float = 0.1,
              early_stopping_patience: int = 10,
              save_path: Optional[str] = None) -> Dict[str, list]:
+        # Calibrate score sign at the start of training
+        self.calibrate_score_sign(pos_pairs, neg_pairs_all, edges)
+        
         if self.enable_progress:
             print("\nGraph Statistics:")
             total_edges = 0
