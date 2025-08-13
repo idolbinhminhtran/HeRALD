@@ -391,6 +391,8 @@ def optuna_objective(trial: 'optuna.Trial',
         keys = param_path.split('.')
         temp = config
         for key in keys[:-1]:
+            if key not in temp:
+                temp[key] = {}  # Create missing nested dict
             temp = temp[key]
         temp[keys[-1]] = value
         params[param_path] = value
@@ -807,12 +809,6 @@ def main():
             'training.label_smoothing': {'type': 'float', 'min': 0.0, 'max': 0.2, 'step': 0.05},
             'training.cosine_tmax': {'type': 'categorical', 'values': [50, 100, 150]},
             
-            # Evaluation parameters
-            'evaluation.loocv_epochs': {'type': 'int', 'min': 10, 'max': 30, 'step': 5},
-            'evaluation.loocv_batch_size': {'type': 'categorical', 'values': [64, 128, 256]},
-            'evaluation.loocv_lr': {'type': 'float', 'min': 1e-3, 'max': 1e-2, 'log': True},
-            'evaluation.loocv_neg_ratio': {'type': 'int', 'min': 1, 'max': 3},
-            
             # Data parameters
             'data.sim_topk': {'type': 'int', 'min': 5, 'max': 30, 'step': 5},
         }
@@ -821,7 +817,7 @@ def main():
     print(f"\n🚀 Starting {args.method} optimization for LOOCV...")
     print(f"🎯 Objective: Maximize LOOCV AUC")
     print(f"📦 Search space: {args.search_space}")
-    print(f"🔬 Evaluation: Sampling {min(50, len(pos_pairs))} LOOCV folds per trial")
+    print(f"🔬 Evaluation: Sampling {min(150, len(pos_pairs))} LOOCV folds per trial")
     print("=" * 60)
     
     if args.method == 'bayesian':
