@@ -357,8 +357,9 @@ def quick_evaluate_loocv(config: Dict[str, Any],
     auc_scores = []
     num_rewrites = 0
     
-    # Process each fold
-    for fold_count, fold_idx in enumerate(selected_folds):
+    # Process each fold with progress tracking
+    from tqdm import tqdm
+    for fold_count, fold_idx in enumerate(tqdm(selected_folds, desc=f"Trial {trial_number} folds", disable=False)):
         # Get test pair
         test_lnc = int(pos_pairs[fold_idx, 0].item())
         test_dis = int(pos_pairs[fold_idx, 1].item())
@@ -429,8 +430,8 @@ def quick_evaluate_loocv(config: Dict[str, Any],
                 dataset_info['num_diseases']
             )
             
-            # Train model
-            num_epochs = min(30, int(config['training'].get('num_epochs', 30)))
+            # Train model (reduced epochs for hyperparameter tuning)
+            num_epochs = min(15, int(config['training'].get('num_epochs', 30)))
             trainer_fold.train(
                 pos_pairs=train_pos_pairs,
                 neg_pairs_all=neg_pairs_all,
