@@ -479,10 +479,15 @@ class HGATLDAEvaluator:
         num_rewrites = 0
         num_folds = len(pos_pairs)
         
-        print(f"Starting LOOCV with rewrite for {num_folds} positive pairs...")
+        print(f"\n{'='*70}")
+        print(f"Starting LOOCV with rewrite for {num_folds} positive pairs")
         print(f"Evaluation settings: neg_sampling=False, full_ranking={full_ranking}")
         print(f"Disease rewrite enabled: {rewrite_isolated}")
         print(f"Training {num_epochs} epochs per fold (neg_ratio={neg_ratio} for training only)")
+        print(f"{'='*70}")
+        print(f"Progress: Each fold shows current & running mean metrics")
+        print(f"Legend: [R] = disease was rewritten due to isolation")
+        print(f"{'='*70}\n")
         
         # Extract necessary matrices from data_dict
         lnc_disease_assoc = data_dict['lnc_disease_assoc']  # disease x lncRNA format
@@ -653,15 +658,25 @@ class HGATLDAEvaluator:
                         'f1_max': fold_f1_max
                     })
                     
-                    # Print progress every 50 folds
-                    if (fold_idx + 1) % 50 == 0 or fold_idx == 0:
-                        mean_auc = np.mean([r['auc'] for r in fold_results])
-                        mean_aupr = np.mean([r['aupr'] for r in fold_results])
-                        mean_f1 = np.mean([r['f1_max'] for r in fold_results])
-                        print(f"\nFold {fold_idx+1}/{num_folds}:")
-                        print(f"  Current: AUC={fold_auc:.3f}, AUPR={fold_aupr:.3f}, F1-max={fold_f1_max:.3f}")
-                        print(f"  Mean so far: AUC={mean_auc:.3f}, AUPR={mean_aupr:.3f}, F1-max={mean_f1:.3f}")
-                        print(f"  Rewrites so far: {num_rewrites}")
+                    # Print progress after EACH fold
+                    mean_auc = np.mean([r['auc'] for r in fold_results])
+                    mean_aupr = np.mean([r['aupr'] for r in fold_results])
+                    mean_f1 = np.mean([r['f1_max'] for r in fold_results])
+                    
+                    # Compact single-line output for each fold
+                    print(f"Fold {fold_idx+1:4d}/{num_folds}: "
+                          f"AUC={fold_auc:.3f} (mean={mean_auc:.3f}), "
+                          f"AUPR={fold_aupr:.3f} (mean={mean_aupr:.3f}), "
+                          f"F1={fold_f1_max:.3f} (mean={mean_f1:.3f}) "
+                          f"{'[R]' if disease_was_rewritten else ''}")
+                    
+                    # Print summary every 100 folds
+                    if (fold_idx + 1) % 100 == 0:
+                        print(f"\n{'─'*60}")
+                        print(f"Summary at fold {fold_idx+1}:")
+                        print(f"  Mean AUC: {mean_auc:.4f}, AUPR: {mean_aupr:.4f}, F1: {mean_f1:.4f}")
+                        print(f"  Rewrites so far: {num_rewrites}/{fold_idx+1} ({num_rewrites/(fold_idx+1)*100:.1f}%)")
+                        print(f"{'─'*60}\n")
         
         # Calculate macro averages
         macro_averages = {
