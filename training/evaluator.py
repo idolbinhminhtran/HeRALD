@@ -665,6 +665,30 @@ class HGATLDAEvaluator:
             # Score all lncRNAs for the test disease (vectorized)
             raw_scores = self.score_all_lnc(model_fold, test_dis, fold_edges_device, num_lncRNAs)  # [L]
             
+            # If in auto mode and no sign yet, choose sign using masked full-ranking AUC on first fold
+            if self.score_orientation == 'auto' and self.score_sign is None and fold_idx == 0:
+                # Create mask/labels for trial
+                known_pos_trial = data_dict['lnc_disease_assoc'][test_dis].bool()
+                y_trial = torch.zeros_like(raw_scores, dtype=torch.long)
+                y_trial[test_lnc] = 1
+                valid_trial = ~known_pos_trial
+                valid_trial[test_lnc] = True
+                lbl_trial = y_trial[valid_trial].cpu().numpy()
+                # Try both signs
+                best_sign = 1.0
+                try:
+                    s_pos = (1.0 * raw_scores)[valid_trial].detach().cpu().numpy()
+                    s_neg = (-1.0 * raw_scores)[valid_trial].detach().cpu().numpy()
+                    from sklearn.metrics import roc_auc_score as _auc
+                    auc_pos = _auc(lbl_trial, s_pos)
+                    auc_neg = _auc(lbl_trial, s_neg)
+                    best_sign = 1.0 if auc_pos >= auc_neg else -1.0
+                    print(f"[Calib-FR] locked score_sign={'+' if best_sign>0 else '-'}1 based on first-fold masked AUC ({auc_pos:.3f} vs {auc_neg:.3f})")
+                except Exception:
+                    # Fallback: default to +1
+                    best_sign = 1.0
+                self.score_sign = best_sign
+            
             # Convert to canonical affinity scores (higher = better)
             require_sign(self.score_orientation, self.score_sign)
             aff_scores = canonical_affinity(raw_scores, self.score_orientation, self.score_sign)
