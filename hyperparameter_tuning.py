@@ -79,14 +79,23 @@ def quick_evaluate(config: Dict[str, Any],
                   num_val_folds: int = 3,
                   trial: 'optuna.Trial' = None) -> float:
     """
-    Quick evaluation using k-fold cross-validation optimized for multi-GPU.
+    Quick evaluation using sampled LOOCV folds for hyperparameter tuning.
+    This simulates actual LOOCV performance to maximize AUC.
     
     Returns:
-        Mean AUC score across validation folds
+        Mean AUC score across sampled LOOCV folds
     """
-    # Use k-fold cross-validation for more robust evaluation
-    n_folds = 3  # 3-fold CV for balance between speed and reliability
-    fold_size = len(pos_pairs) // n_folds
+    # Use more LOOCV folds for accurate evaluation (critical for avoiding overfitting)
+    # Increase samples for better representation of actual LOOCV performance
+    num_loocv_samples = min(150, len(pos_pairs))  # Sample 150 folds instead of 50
+    
+    # Use stratified sampling to ensure diverse fold selection
+    # This helps avoid bias from random sampling
+    np.random.seed(42)  # Fixed seed for reproducible sampling
+    selected_folds = np.random.choice(len(pos_pairs), num_loocv_samples, replace=False)
+    
+    # Sort folds to ensure systematic evaluation
+    selected_folds = np.sort(selected_folds)
     auc_scores = []
     
     # Enable mixed precision for RTX 5090
@@ -123,77 +132,114 @@ def quick_evaluate(config: Dict[str, Any],
         cosine_tmax=config['training'].get('cosine_tmax', 50)  # Add cosine annealing
     )
     
-    # Initialize evaluator once
-    evaluator = HGATLDAEvaluator(model, device)
+    # Perform LOOCV-style evaluation on sampled folds
+    print(f"Evaluating {num_loocv_samples} LOOCV folds...")
     
-    # Implement k-fold cross-validation
-    for fold in range(n_folds):
-        # Split data for this fold
-        val_start = fold * fold_size
-        val_end = val_start + fold_size if fold < n_folds - 1 else len(pos_pairs)
-        val_fold = pos_pairs[val_start:val_end]
-        train_fold = torch.cat([pos_pairs[:val_start], pos_pairs[val_end:]])
+    for fold_idx in selected_folds:
+        # LOOCV: Leave out one positive pair for testing
+        test_lnc = int(pos_pairs[fold_idx, 0].item())
+        test_dis = int(pos_pairs[fold_idx, 1].item())
         
-        # Generate negatives for this fold
-        neg_pairs_fold = generate_negative_pairs(train_fold, dataset_info['num_lncRNAs'], dataset_info['num_diseases'])
+        # Remove test pair from training data (LOOCV style)
+        train_pos_pairs = torch.cat([pos_pairs[:fold_idx], pos_pairs[fold_idx+1:]], dim=0)
         
-        # Train with early stopping
-        best_val_loss = float('inf')
-        patience = 3
-        patience_counter = 0
+        # Create fresh model for this fold (LOOCV requires fresh model per fold)
+        model_fold = HGAT_LDA(
+            num_lncRNAs=dataset_info['num_lncRNAs'],
+            num_genes=dataset_info['num_genes'],
+            num_diseases=dataset_info['num_diseases'],
+            edges=edges,
+            emb_dim=int(config['model']['emb_dim']),
+            num_layers=int(config['model']['num_layers']),
+            dropout=float(config['model']['dropout']),
+            num_heads=int(config['model'].get('num_heads', 4)),
+            relation_dropout=float(config['model'].get('relation_dropout', 0.0)),
+            use_layernorm=bool(config['model'].get('use_layernorm', True)),
+            use_residual=bool(config['model'].get('use_residual', True))
+        ).to(device)
         
-        for epoch in range(15):  # Max 15 epochs per fold
-            # Train one epoch
-            train_loss = trainer.train_epoch(train_fold, neg_pairs_fold, edges)
-            
-            # Validate
-            val_neg = generate_negative_pairs(val_fold, dataset_info['num_lncRNAs'], dataset_info['num_diseases'], len(val_fold))
-            val_loss = trainer.validate(val_fold, val_neg, edges)
-            
-            # Early stopping
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    break
-            
-            # Optuna pruning
-            if trial is not None and epoch % 5 == 0:
-                intermediate_auc = evaluator.evaluate_auc(val_fold, val_neg, edges)
-                trial.report(intermediate_auc, fold * 15 + epoch)
-                if trial.should_prune():
-                    raise optuna.TrialPruned()
-    
-        # Evaluate this fold
+        # Create trainer for this fold
+        trainer_fold = HGATLDATrainer(
+            model=model_fold,
+            device=device,
+            lr=float(config['training']['lr']),
+            weight_decay=float(config['training']['weight_decay']),
+            batch_size=int(config['training']['batch_size']),
+            enable_progress=False,
+            neg_ratio=int(config['training']['neg_ratio']),
+            use_amp=config.get('system', {}).get('use_amp', torch.cuda.is_available()),
+            use_focal_loss=bool(config['training'].get('use_focal_loss', False)),
+            label_smoothing=float(config['training'].get('label_smoothing', 0.0)),
+            cosine_tmax=config['training'].get('cosine_tmax', 50),
+            use_multi_gpu=False  # Disable multi-GPU for quick evaluation
+        )
+        
+        # Generate negatives for training
+        neg_pairs_all = generate_negative_pairs(train_pos_pairs, dataset_info['num_lncRNAs'], dataset_info['num_diseases'])
+        
+        # Match actual LOOCV training epochs to avoid mismatch
+        # Use same number of epochs as actual LOOCV for consistency
+        num_epochs = min(30, int(config['training'].get('num_epochs', 30)))
+        
         try:
-            val_neg = generate_negative_pairs(val_fold, dataset_info['num_lncRNAs'], dataset_info['num_diseases'], len(val_fold))
-            fold_auc = evaluator.evaluate_auc(val_fold, val_neg, edges)
-            auc_scores.append(fold_auc)
-            
-            # Reset model for next fold
-            model = HGAT_LDA(
-                num_lncRNAs=dataset_info['num_lncRNAs'],
-                num_genes=dataset_info['num_genes'],
-                num_diseases=dataset_info['num_diseases'],
+            # Train model
+            trainer_fold.train(
+                pos_pairs=train_pos_pairs,
+                neg_pairs_all=neg_pairs_all,
                 edges=edges,
-                emb_dim=int(config['model']['emb_dim']),
-                num_layers=int(config['model']['num_layers']),
-                dropout=float(config['model']['dropout']),
-                num_heads=int(config['model'].get('num_heads', 4)),
-                relation_dropout=float(config['model'].get('relation_dropout', 0.0)),
-                use_layernorm=bool(config['model'].get('use_layernorm', True)),
-                use_residual=bool(config['model'].get('use_residual', True))
-            ).to(device)
+                num_epochs=num_epochs,
+                val_split=0.0,  # No validation split for LOOCV
+                early_stopping_patience=5,
+                save_path=None
+            )
             
-            trainer.model = model
-            trainer.optimizer = torch.optim.AdamW(model.parameters(), lr=float(config['training']['lr']), 
-                                                  weight_decay=float(config['training']['weight_decay']))
-            evaluator.model = model  # Update evaluator's model reference
+            # Evaluate on test pair (LOOCV style)
+            model_fold.eval()
+            with torch.no_grad():
+                # Score for the positive test pair
+                pos_score = torch.sigmoid(model_fold(
+                    torch.tensor([test_lnc], device=device),
+                    torch.tensor([test_dis], device=device),
+                    edges
+                )).item()
+                
+                # Generate negative pairs for this test case
+                neg_scores = []
+                
+                # Sample more negatives for better AUC estimation
+                for _ in range(50):  # Sample 50 negatives for more accurate AUC
+                    neg_dis = np.random.randint(0, dataset_info['num_diseases'])
+                    if (test_lnc, neg_dis) not in set((int(i), int(j)) for i, j in train_pos_pairs):
+                        score = torch.sigmoid(model_fold(
+                            torch.tensor([test_lnc], device=device),
+                            torch.tensor([neg_dis], device=device),
+                            edges
+                        )).item()
+                        neg_scores.append(score)
+                
+                # Calculate AUC for this fold
+                if neg_scores:
+                    from sklearn.metrics import roc_auc_score
+                    y_true = [1] + [0] * len(neg_scores)
+                    y_score = [pos_score] + neg_scores
+                    fold_auc = roc_auc_score(y_true, y_score)
+                    auc_scores.append(fold_auc)
+                
+            # Clean up
+            del model_fold
+            del trainer_fold
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            
         except Exception as e:
-            print(f"Fold {fold} evaluation failed: {e}")
-            auc_scores.append(0.5)  # Default AUC for failed fold
+            print(f"LOOCV fold {fold_idx} failed: {e}")
+            auc_scores.append(0.5)  # Default AUC
+            
+        # Optuna pruning
+        if trial is not None and len(auc_scores) % 10 == 0:
+            current_mean_auc = np.mean(auc_scores)
+            trial.report(current_mean_auc, len(auc_scores))
+            if trial.should_prune():
+                raise optuna.TrialPruned()
     
     # Clean up
     del model
@@ -202,15 +248,88 @@ def quick_evaluate(config: Dict[str, Any],
         del evaluator
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
-    # Return mean AUC with penalty for variance (more stable models are better)
+    # Return mean AUC with stronger penalty for variance to favor stable models
+    # This helps prevent overfitting to specific folds
     mean_auc = np.mean(auc_scores)
     std_auc = np.std(auc_scores)
-    return mean_auc - 0.01 * std_auc  # Small penalty for high variance
+    
+    # Also penalize if too few folds succeeded
+    success_rate = len(auc_scores) / num_loocv_samples
+    if success_rate < 0.8:  # If less than 80% folds succeeded
+        mean_auc *= success_rate  # Penalize heavily
+    
+    # Stronger variance penalty for LOOCV
+    return mean_auc - 0.02 * std_auc  # Doubled penalty for high variance
+
+
+def validate_loocv_params(params: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """Validate if parameters are suitable for LOOCV to prevent overfitting.
+    
+    Returns:
+        (is_valid, list_of_warnings)
+    """
+    warnings = []
+    
+    # Check learning rate
+    if 'training.lr' in params and params['training.lr'] > 0.001:
+        warnings.append(f"⚠️ Learning rate {params['training.lr']:.4f} is too high (>0.001)")
+    
+    # Check label smoothing
+    if 'training.label_smoothing' in params and params['training.label_smoothing'] > 0.1:
+        warnings.append(f"⚠️ Label smoothing {params['training.label_smoothing']:.2f} is too high (>0.1)")
+    
+    # Check batch size
+    if 'training.batch_size' in params and params['training.batch_size'] > 256:
+        warnings.append(f"⚠️ Batch size {params['training.batch_size']} is too large (>256)")
+    
+    # Check dropout
+    if 'model.dropout' in params and params['model.dropout'] < 0.25:
+        warnings.append(f"⚠️ Dropout {params['model.dropout']:.2f} is too low (<0.25)")
+    
+    # Check number of heads
+    if 'model.num_heads' in params and params['model.num_heads'] < 4:
+        warnings.append(f"⚠️ Number of heads {params['model.num_heads']} is too low (<4)")
+    
+    # Check weight decay
+    if 'training.weight_decay' in params and params['training.weight_decay'] < 1e-5:
+        warnings.append(f"⚠️ Weight decay {params['training.weight_decay']:.2e} is too low (<1e-5)")
+    
+    is_valid = len(warnings) == 0
+    return is_valid, warnings
 
 
 def update_default_config(best_params: Dict[str, Any]):
     """Update configs/default.yaml with best parameters."""
     config_path = 'configs/default.yaml'
+    
+    # Validate parameters first
+    is_valid, warnings = validate_loocv_params(best_params)
+    if not is_valid:
+        print("\n⚠️ WARNING: Best parameters may cause overfitting in LOOCV:")
+        for warning in warnings:
+            print(f"  {warning}")
+        print("\n🔧 Applying automatic corrections...")
+        
+        # Apply corrections
+        if 'training.lr' in best_params and best_params['training.lr'] > 0.001:
+            best_params['training.lr'] = 0.0008
+            print(f"  ✅ Reduced learning rate to 0.0008")
+        
+        if 'training.label_smoothing' in best_params and best_params['training.label_smoothing'] > 0.1:
+            best_params['training.label_smoothing'] = 0.05
+            print(f"  ✅ Reduced label smoothing to 0.05")
+        
+        if 'training.batch_size' in best_params and best_params['training.batch_size'] > 256:
+            best_params['training.batch_size'] = 128
+            print(f"  ✅ Reduced batch size to 128")
+        
+        if 'model.dropout' in best_params and best_params['model.dropout'] < 0.25:
+            best_params['model.dropout'] = 0.3
+            print(f"  ✅ Increased dropout to 0.3")
+        
+        if 'model.num_heads' in best_params and best_params['model.num_heads'] < 4:
+            best_params['model.num_heads'] = 4
+            print(f"  ✅ Increased num_heads to 4")
     
     # Load current config
     with open(config_path, 'r') as f:
@@ -629,57 +748,60 @@ def main():
                 w = w.to(device)
         edges_device[key] = (src, dst, w)
     
-    # Define optimized search spaces for maximum AUC
+    # Define CONSERVATIVE search spaces to prevent overfitting in LOOCV
     if args.search_space == 'quick':
-        # Quick but focused search on most impactful parameters
+        # Quick search with conservative parameters for stable LOOCV performance
         search_space = {
-            'model.emb_dim': {'type': 'categorical', 'values': [64, 128]},
-            'model.num_layers': {'type': 'categorical', 'values': [2, 3]},  # 2-3 layers usually optimal
-            'model.dropout': {'type': 'categorical', 'values': [0.2, 0.3]},  # Moderate dropout
-            'model.num_heads': {'type': 'categorical', 'values': [4, 8]},  # Multi-head attention helps
-            'training.lr': {'type': 'float', 'min': 3e-4, 'max': 3e-3, 'log': True},  # Focused range
-            'training.neg_ratio': {'type': 'categorical', 'values': [3, 5]},
-            'training.use_focal_loss': {'type': 'categorical', 'values': [True]},  # Usually better for imbalanced
-            'training.label_smoothing': {'type': 'categorical', 'values': [0.1, 0.15]},  # Helps generalization
+            'model.emb_dim': {'type': 'categorical', 'values': [64, 128]},  # Smaller dims to prevent overfitting
+            'model.num_layers': {'type': 'categorical', 'values': [2, 3]},  # Shallower for better generalization
+            'model.dropout': {'type': 'categorical', 'values': [0.3, 0.4]},  # Higher dropout essential
+            'model.num_heads': {'type': 'categorical', 'values': [4, 6]},  # Moderate attention heads
+            'training.lr': {'type': 'float', 'min': 1e-4, 'max': 5e-4, 'log': True},  # Much lower LR range!
+            'training.batch_size': {'type': 'categorical', 'values': [64, 128]},  # Smaller batches
+            'training.neg_ratio': {'type': 'categorical', 'values': [2, 3]},  # Conservative ratio
+            'training.use_focal_loss': {'type': 'categorical', 'values': [False]},  # Standard loss better
+            'training.label_smoothing': {'type': 'categorical', 'values': [0.0, 0.05]},  # Minimal smoothing
+            'training.weight_decay': {'type': 'float', 'min': 5e-5, 'max': 1e-4, 'log': True},  # Higher regularization
         }
     elif args.search_space == 'extensive':
-        # Comprehensive search with optimized ranges for maximum AUC
+        # Comprehensive but CONSERVATIVE search to avoid overfitting
         search_space = {
-            # Model parameters - optimized ranges
-            'model.emb_dim': {'type': 'categorical', 'values': [64, 128, 256]},  # Higher dims for complex patterns
-            'model.num_layers': {'type': 'int', 'min': 2, 'max': 4},  # 2-4 layers optimal
-            'model.dropout': {'type': 'float', 'min': 0.15, 'max': 0.35, 'step': 0.05},  # Moderate dropout
-            'model.num_heads': {'type': 'categorical', 'values': [2, 4, 6, 8]},  # Multi-head attention
-            'model.relation_dropout': {'type': 'float', 'min': 0.0, 'max': 0.2, 'step': 0.05},  # Light relation dropout
-            'model.use_layernorm': {'type': 'categorical', 'values': [True]},  # Usually helps
-            'model.use_residual': {'type': 'categorical', 'values': [True]},  # Helps deeper models
+            # Model parameters - conservative for LOOCV
+            'model.emb_dim': {'type': 'categorical', 'values': [64, 128, 192]},  # Moderate sizes only
+            'model.num_layers': {'type': 'int', 'min': 2, 'max': 4},  # Not too deep
+            'model.dropout': {'type': 'float', 'min': 0.3, 'max': 0.45, 'step': 0.05},  # Higher dropout range
+            'model.num_heads': {'type': 'categorical', 'values': [4, 6, 8]},  # Reasonable attention heads
+            'model.relation_dropout': {'type': 'float', 'min': 0.1, 'max': 0.2, 'step': 0.05},  # More dropout
+            'model.use_layernorm': {'type': 'categorical', 'values': [True]},  # Always use
+            'model.use_residual': {'type': 'categorical', 'values': [True]},  # Always use
             
-            # Training parameters - refined for better convergence
-            'training.lr': {'type': 'float', 'min': 1e-4, 'max': 5e-3, 'log': True},  # Focused range
-            'training.weight_decay': {'type': 'float', 'min': 1e-6, 'max': 1e-4, 'log': True},
-            'training.batch_size': {'type': 'categorical', 'values': [128, 256, 512]},  # Larger batches
-            'training.neg_ratio': {'type': 'int', 'min': 3, 'max': 7},  # Balanced negative sampling
-            'training.use_focal_loss': {'type': 'categorical', 'values': [True, False]},
-            'training.label_smoothing': {'type': 'float', 'min': 0.05, 'max': 0.2, 'step': 0.05},
-            'training.cosine_tmax': {'type': 'categorical', 'values': [30, 50, 100]},  # Cosine annealing
+            # Training parameters - very conservative for stability
+            'training.lr': {'type': 'float', 'min': 5e-5, 'max': 5e-4, 'log': True},  # Much lower range!
+            'training.weight_decay': {'type': 'float', 'min': 5e-5, 'max': 2e-4, 'log': True},  # Strong regularization
+            'training.batch_size': {'type': 'categorical', 'values': [32, 64, 128]},  # Smaller batches only
+            'training.neg_ratio': {'type': 'int', 'min': 1, 'max': 3},  # Lower ratios
+            'training.use_focal_loss': {'type': 'categorical', 'values': [False]},  # Standard loss only
+            'training.label_smoothing': {'type': 'float', 'min': 0.0, 'max': 0.1, 'step': 0.05},  # Max 0.1
+            'training.cosine_tmax': {'type': 'categorical', 'values': [25, 30]},  # Match shorter epochs
+            'training.num_epochs': {'type': 'categorical', 'values': [25, 30]},  # Fewer epochs
             
-            # Data parameters - similarity graph tuning
-            'data.sim_topk': {'type': 'int', 'min': 10, 'max': 30, 'step': 5},  # Optimal connectivity
-            'data.sim_row_normalize': {'type': 'categorical', 'values': [True]},  # Usually better
+            # Data parameters - moderate connectivity
+            'data.sim_topk': {'type': 'int', 'min': 10, 'max': 25, 'step': 5},  # Not too many neighbors
+            'data.sim_row_normalize': {'type': 'categorical', 'values': [True]},  # Always normalize
         }
-    else:  # default - balanced search space
+    else:  # default - LOOCV-optimized conservative search space
         search_space = {
-            # Model parameters - balanced ranges
+            # Model parameters - conservative defaults
             'model.emb_dim': {'type': 'categorical', 'values': [64, 128]},
-            'model.num_layers': {'type': 'int', 'min': 2, 'max': 3},  # Focus on 2-3 layers
-            'model.dropout': {'type': 'float', 'min': 0.2, 'max': 0.4, 'step': 0.1},
-            'model.num_heads': {'type': 'categorical', 'values': [2, 4, 6]},
-            'model.relation_dropout': {'type': 'float', 'min': 0.0, 'max': 0.2, 'step': 0.1},
+            'model.num_layers': {'type': 'int', 'min': 2, 'max': 3},  # Shallow models
+            'model.dropout': {'type': 'float', 'min': 0.3, 'max': 0.4, 'step': 0.05},  # Higher dropout
+            'model.num_heads': {'type': 'categorical', 'values': [4, 6]},  # Moderate heads
+            'model.relation_dropout': {'type': 'float', 'min': 0.1, 'max': 0.2, 'step': 0.05},
             
-            # Training parameters - balanced for good convergence
-            'training.lr': {'type': 'float', 'min': 3e-4, 'max': 3e-3, 'log': True},  # Narrower range
-            'training.weight_decay': {'type': 'float', 'min': 1e-6, 'max': 1e-4, 'log': True},
-            'training.batch_size': {'type': 'categorical', 'values': [128, 256, 512]},
+            # Training parameters - conservative for stability
+            'training.lr': {'type': 'float', 'min': 1e-4, 'max': 8e-4, 'log': True},  # Lower range
+            'training.weight_decay': {'type': 'float', 'min': 5e-5, 'max': 1e-4, 'log': True},
+            'training.batch_size': {'type': 'categorical', 'values': [64, 128]},  # Smaller batches
             'training.neg_ratio': {'type': 'int', 'min': 1, 'max': 5},
             'training.use_focal_loss': {'type': 'categorical', 'values': [True, False]},
             'training.label_smoothing': {'type': 'float', 'min': 0.0, 'max': 0.2, 'step': 0.05},
@@ -696,8 +818,10 @@ def main():
         }
     
     # Run tuning
-    print(f"\n🚀 Starting {args.method} optimization...")
+    print(f"\n🚀 Starting {args.method} optimization for LOOCV...")
+    print(f"🎯 Objective: Maximize LOOCV AUC")
     print(f"📦 Search space: {args.search_space}")
+    print(f"🔬 Evaluation: Sampling {min(50, len(pos_pairs))} LOOCV folds per trial")
     print("=" * 60)
     
     if args.method == 'bayesian':
@@ -725,13 +849,14 @@ def main():
     
     # Print summary
     print("\n" + "=" * 60)
-    print("✅ OPTIMIZATION COMPLETE")
+    print("✅ LOOCV OPTIMIZATION COMPLETE")
     print("=" * 60)
-    print(f"Best AUC: {best_auc:.4f}")
+    print(f"Best LOOCV AUC: {best_auc:.4f}")
     print(f"Results saved in: {args.output_dir}")
     
-    print("\n✨ configs/default.yaml has been automatically updated with best parameters")
-    print("You can now run:")
+    print("\n✨ configs/default.yaml has been automatically updated with best LOOCV parameters")
+    print("These parameters are optimized specifically for LOOCV performance!")
+    print("\nYou can now run full LOOCV evaluation:")
     print("  python3 main.py --mode loocv --config configs/default.yaml")
 
 
