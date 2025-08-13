@@ -159,7 +159,7 @@ class HGATLDATrainer:
             edges_device[key] = (src, dst, w)
         return edges_device
     
-    def calibrate_score_sign(self, pos_pairs: torch.Tensor, edges: Dict, batch_size: int = 256) -> None:
+    def calibrate_score_sign(self, pos_pairs: torch.Tensor, edges: Dict, batch_size: int = 64) -> None:
         """
         Calibrate score sign by sampling positives/negatives and checking raw score gap.
         
@@ -176,81 +176,59 @@ class HGATLDATrainer:
             # Already calibrated
             return
         
-        # Sample a small batch for calibration
-        n_pos = min(batch_size, len(pos_pairs))
-        sample_indices = torch.randperm(len(pos_pairs))[:n_pos]
-        sample_pos = pos_pairs[sample_indices]
-        
-        pos_lnc = sample_pos[:, 0].to(self.device)
-        pos_dis = sample_pos[:, 1].to(self.device)
-        
-        # Create a set of known positives for masking
-        known_positives = set()
-        for l, d in pos_pairs:
-            known_positives.add((l.item(), d.item()))
-        
-        # For each positive, find a valid negative from same disease
-        neg_lnc = []
-        neg_dis = []
-        
-        for i, (l, d) in enumerate(zip(pos_lnc, pos_dis)):
-            d_val = d.item()
-            l_val = l.item()
+        try:
+            # Use a simpler approach: sample from existing negative pairs
+            from data.graph_construction import generate_negative_pairs
             
-            # Find candidate negative lncRNAs for this disease
-            # Sample from all lncRNAs and filter out known positives
-            max_lnc = max(pos_pairs[:, 0].max().item(), 500)  # Conservative estimate
-            candidates = []
-            attempts = 0
+            # Get dataset dimensions from pos_pairs
+            max_lnc = pos_pairs[:, 0].max().item() + 1
+            max_dis = pos_pairs[:, 1].max().item() + 1
             
-            while len(candidates) < 5 and attempts < 100:  # Try to find 5 candidates
-                rand_lnc = torch.randint(0, max_lnc, (10,)).to(self.device)
-                for rl in rand_lnc:
-                    if (rl.item(), d_val) not in known_positives and rl.item() != l_val:
-                        candidates.append(rl.item())
-                        if len(candidates) >= 5:
-                            break
-                attempts += 1
+            # Generate negative pairs using the same method as training
+            neg_pairs_all = generate_negative_pairs(pos_pairs, max_lnc, max_dis)
             
-            if candidates:
-                # Pick first candidate as negative
-                neg_lnc.append(candidates[0])
-                neg_dis.append(d_val)
-        
-        if len(neg_lnc) == 0:
-            # Fallback: use random negatives
+            # Sample a small batch for calibration
+            n_samples = min(batch_size, len(pos_pairs), len(neg_pairs_all))
+            
+            # Sample positives
+            pos_indices = torch.randperm(len(pos_pairs))[:n_samples]
+            sample_pos = pos_pairs[pos_indices]
+            
+            # Sample negatives
+            neg_indices = torch.randperm(len(neg_pairs_all))[:n_samples]
+            sample_neg = neg_pairs_all[neg_indices]
+            
+            # Move to device
+            pos_lnc = sample_pos[:, 0].to(self.device)
+            pos_dis = sample_pos[:, 1].to(self.device)
+            neg_lnc = sample_neg[:, 0].to(self.device)
+            neg_dis = sample_neg[:, 1].to(self.device)
+            
+            # Move edges to device
+            edges_device = self._move_edges_to_device(edges)
+            
+            # Compute raw scores (no canonicalization)
+            self.model.eval()
+            with torch.no_grad():
+                raw_pos = self.model(pos_lnc, pos_dis, edges_device)
+                raw_neg = self.model(neg_lnc, neg_dis, edges_device)
+                
+                # Compute mean gap
+                gap = (raw_pos - raw_neg).mean().item()
+                
+                # Set sign based on gap
+                self.score_sign = 1.0 if gap >= 0 else -1.0
+                
+                print(f"[Calib] score_orientation={self.score_orientation}, "
+                      f"score_sign={'+1' if self.score_sign > 0 else '-1'}, "
+                      f"mean_gap={gap:.4f}")
+            
+            self.model.train()
+            
+        except Exception as e:
+            # Fallback: default to positive sign
+            print(f"[Calib] Calibration failed ({e}), defaulting to score_sign=+1")
             self.score_sign = 1.0
-            print("[Calib] No valid negatives found, defaulting to score_sign=+1")
-            return
-        
-        # Convert to tensors
-        neg_lnc = torch.tensor(neg_lnc, device=self.device)
-        neg_dis = torch.tensor(neg_dis, device=self.device)
-        
-        # Truncate positives to match negatives
-        pos_lnc = pos_lnc[:len(neg_lnc)]
-        pos_dis = pos_dis[:len(neg_dis)]
-        
-        # Move edges to device
-        edges_device = self._move_edges_to_device(edges)
-        
-        # Compute raw scores (no canonicalization)
-        self.model.eval()
-        with torch.no_grad():
-            raw_pos = self.model(pos_lnc, pos_dis, edges_device)
-            raw_neg = self.model(neg_lnc, neg_dis, edges_device)
-            
-            # Compute mean gap
-            gap = (raw_pos - raw_neg).mean().item()
-            
-            # Set sign based on gap
-            self.score_sign = 1.0 if gap >= 0 else -1.0
-            
-            print(f"[Calib] score_orientation={self.score_orientation}, "
-                  f"score_sign={'+1' if self.score_sign > 0 else '-1'}, "
-                  f"mean_gap={gap:.4f}")
-        
-        self.model.train()
     
     def get_score_sign(self) -> Optional[float]:
         """Get the calibrated score sign."""
