@@ -9,6 +9,7 @@ model:
   use_layernorm: true
   use_residual: true
   use_relation_norm: true    # normalize per relation (D^-1 A)
+  score_orientation: auto    # affinity | distance | auto (default: auto)
 
 training:
   # Optimizer/schedule

@@ -12,6 +12,7 @@ import time
 from models.hgat_lda import HGAT_LDA
 from training.trainer import HGATLDATrainer
 from data.graph_construction import get_positive_pairs, generate_negative_pairs, rewrite_ld_for_isolated_diseases, construct_heterogeneous_graph
+from utils.scoring import canonical_affinity
 
 
 class HGATLDAEvaluator:
@@ -19,7 +20,8 @@ class HGATLDAEvaluator:
     Evaluator class for HGAT-LDA model.
     """
     
-    def __init__(self, model: HGAT_LDA, device: torch.device, full_ranking: bool = True):
+    def __init__(self, model: HGAT_LDA, device: torch.device, full_ranking: bool = True,
+                 score_orientation: str = 'auto', score_sign: Optional[float] = None):
         """
         Initialize the evaluator.
         
@@ -27,10 +29,14 @@ class HGATLDAEvaluator:
             model: HGAT-LDA model
             device: Device to evaluate on
             full_ranking: Whether to use full ranking (all negatives) during evaluation
+            score_orientation: Score orientation ('affinity', 'distance', or 'auto')
+            score_sign: Sign multiplier from calibration (for auto mode)
         """
         self.model = model.to(device)
         self.device = device
         self.full_ranking = full_ranking
+        self.score_orientation = score_orientation
+        self.score_sign = score_sign
     
     def score_all_lnc(self,
                       model: torch.nn.Module,
@@ -601,39 +607,45 @@ class HGATLDAEvaluator:
                 use_focal_loss=use_focal_loss,
                 label_smoothing=label_smoothing,
                 cosine_tmax=cosine_tmax if cosine_tmax else num_epochs,
-                use_multi_gpu=True
+                use_multi_gpu=True,
+                score_orientation=self.score_orientation
             )
             
             # Generate negative pairs for training
             neg_pairs_all = generate_negative_pairs(train_pos_pairs, num_lncRNAs, num_diseases)
             
-            # Train the model (suppress output)
-            old_stdout = sys.stdout
-            sys.stdout = open(os.devnull, 'w')
-            try:
-                trainer.train(
-                    pos_pairs=train_pos_pairs,
-                    neg_pairs_all=neg_pairs_all,
-                    edges=fold_edges_device,
-                    num_epochs=num_epochs,
-                    val_split=0.1,
-                    early_stopping_patience=5,
-                    save_path=None
-                )
-            finally:
-                sys.stdout = old_stdout
+            # Train the model (suppress most output but keep calibration)
+            trainer.train(
+                pos_pairs=train_pos_pairs,
+                neg_pairs_all=neg_pairs_all,
+                edges=fold_edges_device,
+                num_epochs=num_epochs,
+                val_split=0.1,
+                early_stopping_patience=5,
+                save_path=None
+            )
+            
+            # Get calibrated score_sign from trainer (if not already set)
+            if self.score_sign is None and trainer.score_sign is not None:
+                self.score_sign = trainer.score_sign
+                if fold_idx == 0:  # Print calibration info on first fold
+                    print(f"[Score Calibration] orientation={self.score_orientation}, "
+                          f"score_sign={'+1' if self.score_sign > 0 else '-1'}")
             
             # Full-ranking evaluation with proper masking
             model_fold.eval()
             
             # Score all lncRNAs for the test disease (vectorized)
-            scores = self.score_all_lnc(model_fold, test_dis, fold_edges_device, num_lncRNAs)  # [L]
+            raw_scores = self.score_all_lnc(model_fold, test_dis, fold_edges_device, num_lncRNAs)  # [L]
+            
+            # Convert to canonical affinity scores (higher = better)
+            aff_scores = canonical_affinity(raw_scores, self.score_orientation, self.score_sign)
             
             # Create mask for known positives (from original data, not just training)
             known_pos = data_dict['lnc_disease_assoc'][test_dis].bool()  # [L]
             
             # Create labels: only test_lnc is positive
-            y = torch.zeros_like(scores, dtype=torch.long)
+            y = torch.zeros_like(aff_scores, dtype=torch.long)
             y[test_lnc] = 1
             
             # Create valid mask: exclude other known positives but include test_lnc
@@ -641,19 +653,19 @@ class HGATLDAEvaluator:
             valid[test_lnc] = True
             
             # Extract valid scores and labels for evaluation
-            s = scores[valid].detach().cpu().numpy()
+            s = aff_scores[valid].detach().cpu().numpy()
             lbl = y[valid].cpu().numpy()
             
-            # Calculate metrics with inversion guard
+            # Calculate metrics (NO per-fold flipping!)
             if len(s) > 1 and lbl.sum() > 0:  # Ensure we have both pos and neg
-                # Try both orientations
+                # Calculate AUC with canonical affinity scores
                 fold_auc = roc_auc_score(lbl, s)
-                fold_auc_inv = roc_auc_score(lbl, -s)
                 
+                # Check for inversion as WARNING ONLY
+                fold_auc_inv = roc_auc_score(lbl, -s)
                 if fold_auc_inv > fold_auc + 1e-4:
-                    print(f"  ⚠️ Fold {fold_idx+1}: inversion detected, using -scores (AUC: {fold_auc:.3f} → {fold_auc_inv:.3f})")
-                    fold_auc = fold_auc_inv
-                    s = -s  # Use inverted scores for other metrics
+                    print(f"  ⚠️ Fold {fold_idx+1}: inversion warning - auc_inv={fold_auc_inv:.3f} > auc={fold_auc:.3f}. Check score plumbing.")
+                    # DO NOT flip scores!
                 
                 fold_aupr = average_precision_score(lbl, s)
                 
@@ -662,9 +674,9 @@ class HGATLDAEvaluator:
                 f1_scores = 2 * (precision * recall) / (precision + recall + 1e-8)
                 fold_f1_max = np.max(f1_scores[np.isfinite(f1_scores)])
                 
-                # Calculate rank of true lncRNA (for diagnostics)
-                true_score = scores[test_lnc].item()
-                rank = (scores > true_score).sum().item() + 1
+                # Calculate rank of true lncRNA using affinity scores (higher = better)
+                true_score = aff_scores[test_lnc].item()
+                rank = (aff_scores > true_score).sum().item() + 1
                 
                 fold_results.append({
                     'fold': fold_idx + 1,

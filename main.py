@@ -105,7 +105,8 @@ def run_training(config: Dict[str, Any], dataset_info: Dict, edges: Dict, pos_pa
         use_multi_gpu=True,  # Enable multi-GPU by default
         loss_type=config['training'].get('loss_type', 'bce'),
         pairwise_type=config['training'].get('pairwise_type', 'bpr'),
-        use_hard_negatives=config['training'].get('use_hard_negatives', True)
+        use_hard_negatives=config['training'].get('use_hard_negatives', True),
+        score_orientation=config['model'].get('score_orientation', 'auto')
     )
     
     # Generate negative pairs
@@ -249,7 +250,14 @@ def run_loocv(config: Dict[str, Any], dataset_info: Dict, edges: Dict, pos_pairs
     ).to(device)
     
     # Create evaluator with full_ranking setting
-    evaluator = HGATLDAEvaluator(model, device, full_ranking=full_ranking)
+    score_orientation = config['model'].get('score_orientation', 'auto')
+    evaluator = HGATLDAEvaluator(model, device, full_ranking=full_ranking,
+                                 score_orientation=score_orientation, score_sign=None)
+    
+    # Print scoring configuration
+    print(f"\n📊 Scoring Configuration:")
+    print(f"   - Score orientation: {score_orientation}")
+    print(f"   - Score sign: will be calibrated in first fold")
     
     # Run LOOCV with rewrite support
     results = evaluator.run_loocv_with_rewrite(

@@ -14,6 +14,7 @@ import os
 from models.hgat_lda import HGAT_LDA
 from data.graph_construction import get_positive_pairs, generate_negative_pairs
 from models.losses import get_loss_function, compute_hard_negatives, FocalLoss as FocalLossNew
+from utils.scoring import canonical_affinity, calibrate_score_sign
 
 
 class FocalLoss(nn.Module):
@@ -56,7 +57,8 @@ class HGATLDATrainer:
                  full_ranking_eval: bool = True,
                  loss_type: str = 'bce',
                  pairwise_type: str = 'bpr',
-                 use_hard_negatives: bool = True):
+                 use_hard_negatives: bool = True,
+                 score_orientation: str = 'auto'):
         """
         Initialize the trainer with optional multi-GPU support.
         
@@ -75,6 +77,7 @@ class HGATLDATrainer:
             loss_type: Type of loss ('bce', 'focal', 'pairwise')
             pairwise_type: Type of pairwise loss ('bpr' or 'auc') when loss_type='pairwise'
             use_hard_negatives: Whether to use hard negative mining for pairwise losses
+            score_orientation: Score orientation ('affinity', 'distance', or 'auto')
         """
         # Move model to device first
         self.model = model.to(device)
@@ -96,6 +99,9 @@ class HGATLDATrainer:
         self.loss_type = loss_type.lower()
         self.pairwise_type = pairwise_type.lower()
         self.use_hard_negatives = use_hard_negatives
+        self.score_orientation = score_orientation
+        self.score_sign = None  # Will be calibrated on first batch if orientation='auto'
+        self.calibrated = False
         
         # Optimizer with improved settings
         self.optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, betas=(0.9, 0.999))
@@ -153,7 +159,8 @@ class HGATLDATrainer:
             edges_device[key] = (src, dst, w)
         return edges_device
     
-    def train_epoch(self, pos_pairs: torch.Tensor, neg_pairs_all: torch.Tensor, edges: Dict) -> Tuple[float, Optional[Dict]]:
+    def train_epoch(self, pos_pairs: torch.Tensor, neg_pairs_all: torch.Tensor, edges: Dict, 
+                   train_pos_pairs: torch.Tensor = None) -> Tuple[float, Optional[Dict]]:
         """
         Train for one epoch.
         
@@ -230,9 +237,12 @@ class HGATLDATrainer:
                                     d_repeated = d.repeat(len(neg_lncs_for_d))
                                     neg_scores = self.model(neg_lncs_for_d, d_repeated, edges_device)
                                     
-                                    # Select hardest negatives (highest scores)
-                                    k = min(mask.sum().item(), len(neg_scores))
-                                    _, hard_idx = torch.topk(neg_scores, k)
+                                    # Convert to canonical affinity for hard mining (highest affinity = hardest)
+                                    neg_affinity = canonical_affinity(neg_scores, self.score_orientation, self.score_sign)
+                                    
+                                    # Select hardest negatives (highest affinity scores)
+                                    k = min(mask.sum().item(), len(neg_affinity))
+                                    _, hard_idx = torch.topk(neg_affinity, k)
                                     
                                     hard_neg_lnc.append(neg_lncs_for_d[hard_idx])
                                     hard_neg_dis.append(d_repeated[hard_idx])
@@ -271,11 +281,41 @@ class HGATLDATrainer:
                     with torch.cuda.amp.autocast(enabled=True):
                         pos_scores = self.model(pos_lnc, pos_dis, edges_device)
                         neg_scores = self.model(neg_lnc, neg_dis, edges_device)
-                        loss = self.criterion(pos_scores, neg_scores)
+                        
+                        # Calibrate score sign on first batch if needed
+                        if not self.calibrated and self.score_orientation == 'auto':
+                            self.score_sign = calibrate_score_sign(pos_scores.detach(), neg_scores.detach(), self.score_orientation)
+                            self.calibrated = True
+                        
+                        # Convert to canonical affinity scores
+                        aff_pos = canonical_affinity(pos_scores, self.score_orientation, self.score_sign)
+                        aff_neg = canonical_affinity(neg_scores, self.score_orientation, self.score_sign)
+                        
+                        # Logistic AUC surrogate loss: -log σ(s_pos - s_neg)
+                        if self.pairwise_type == 'auc':
+                            loss = nn.functional.softplus(-(aff_pos - aff_neg)).mean()
+                        else:
+                            # BPR or other pairwise losses
+                            loss = self.criterion(aff_pos, aff_neg)
                 else:
                     pos_scores = self.model(pos_lnc, pos_dis, edges_device)
                     neg_scores = self.model(neg_lnc, neg_dis, edges_device)
-                    loss = self.criterion(pos_scores, neg_scores)
+                    
+                    # Calibrate score sign on first batch if needed
+                    if not self.calibrated and self.score_orientation == 'auto':
+                        self.score_sign = calibrate_score_sign(pos_scores.detach(), neg_scores.detach(), self.score_orientation)
+                        self.calibrated = True
+                    
+                    # Convert to canonical affinity scores
+                    aff_pos = canonical_affinity(pos_scores, self.score_orientation, self.score_sign)
+                    aff_neg = canonical_affinity(neg_scores, self.score_orientation, self.score_sign)
+                    
+                    # Logistic AUC surrogate loss: -log σ(s_pos - s_neg)
+                    if self.pairwise_type == 'auc':
+                        loss = nn.functional.softplus(-(aff_pos - aff_neg)).mean()
+                    else:
+                        # BPR or other pairwise losses
+                        loss = self.criterion(aff_pos, aff_neg)
                 
                 # Track scores for metrics
                 pos_scores_list.append(pos_scores.detach().mean().item())
@@ -364,7 +404,7 @@ class HGATLDATrainer:
         patience_counter = 0
         
         for epoch in range(1, num_epochs + 1):
-            train_loss, train_metrics = self.train_epoch(train_pos, neg_pairs_all, edges)
+            train_loss, train_metrics = self.train_epoch(train_pos, neg_pairs_all, edges, train_pos)
             self.train_losses.append(train_loss)
             val_loss = self.validate(val_pos, neg_pairs_all, edges)
             self.val_losses.append(val_loss)
