@@ -4,7 +4,7 @@ Graph construction utilities for HGAT-LDA model.
 
 import torch
 import numpy as np
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Any
 
 
 def _row_normalize(mat: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -350,8 +350,81 @@ def generate_negative_pairs(pos_pairs: torch.Tensor,
         return neg_pairs_all
 
 
-def rewrite_ld_for_isolated_diseases(ld_mat: torch.Tensor, 
-                                    dis_sim: torch.Tensor, 
+def build_fold_edges(data_dict: Dict[str, torch.Tensor],
+                    config: Dict[str, Any],
+                    l_idx: int,
+                    d_idx: int) -> Dict:
+    """
+    Build graph edges for a specific LOOCV fold, removing the test edge
+    and rewriting isolated diseases into the LD matrix.
+    
+    Args:
+        data_dict: Dataset dictionary
+        config: Configuration
+        l_idx: Test lncRNA index
+        d_idx: Test disease index
+        
+    Returns:
+        Edges dictionary for this fold
+    """
+    # Clone the lnc-disease association matrix
+    ld = data_dict['lnc_disease_assoc'].clone()
+    
+    # Remove held-out link
+    original_value = ld[d_idx, l_idx].item()
+    ld[d_idx, l_idx] = 0
+    
+    removed_edge_present = original_value > 0
+    rewrite_applied = False
+    
+    # Check if disease is now isolated and rewrite if needed
+    if config.get('eval', {}).get('rewrite_isolated', True) and ld[d_idx].sum() == 0:
+        # Disease is isolated, rewrite using disease similarity
+        ds = data_dict['DD_sim']  # [D, D]
+        
+        # Get similarity weights (exclude self)
+        w = ds[d_idx].clone()
+        w[d_idx] = 0  # Zero self-similarity
+        w = torch.softmax(w, dim=0)  # Normalize to probability distribution
+        
+        # Project via similar diseases → pseudo-links for this disease
+        ld[d_idx, :] = (w.unsqueeze(0) @ ld).squeeze(0)
+        ld[d_idx, l_idx] = 0  # Keep test link out
+        rewrite_applied = True
+        
+        print(f"  Fold {l_idx},{d_idx}: removed_edge={removed_edge_present}, "
+              f"rewrite_applied=True, disease_degree_after={ld[d_idx].sum().item():.2f}")
+    
+    # Create modified data dict for this fold
+    dd = dict(data_dict)
+    dd['lnc_disease_assoc'] = ld
+    
+    # Build graph for this fold
+    edges = construct_heterogeneous_graph(
+        dd,
+        sim_topk=config['data'].get('sim_topk', 30),
+        sim_row_normalize=config['data'].get('sim_row_normalize', True),
+        sim_threshold=config['data'].get('threshold', 0.0),
+        sim_mutual=config['data'].get('sim_mutual', False),
+        sim_sym=config['data'].get('sim_sym', True),
+        sim_row_norm=config['data'].get('sim_row_norm', True),
+        sim_tau=config['data'].get('sim_tau', None),
+        use_bipartite_edge_weight=config['data'].get('use_bipartite_edge_weight', False),
+        verbose=False
+    )
+    
+    # Count lnc-disease edges for logging
+    ld_edges = 0
+    for (src_type, rel_name, dst_type), (src_idx, dst_idx, w) in edges.items():
+        if 'lnc' in src_type.lower() and 'disease' in dst_type.lower():
+            ld_edges = len(src_idx) if src_idx is not None else 0
+            break
+    
+    return edges, removed_edge_present, rewrite_applied, ld_edges
+
+
+def rewrite_ld_for_isolated_diseases(ld_mat: torch.Tensor,
+                                    dis_sim: torch.Tensor,
                                     disease_idx: int) -> torch.Tensor:
     """
     Rewrite the lncRNA-disease matrix for an isolated disease by replacing

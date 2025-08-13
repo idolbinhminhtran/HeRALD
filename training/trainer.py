@@ -186,11 +186,16 @@ class HGATLDATrainer:
             if self.is_pairwise:
                 # For pairwise losses, handle differently
                 
-                # Sample or mine hard negatives
+                # Sample or mine hard negatives (MUST be from same disease)
                 if self.use_hard_negatives and len(neg_pairs_all) > 0:
-                    # Mine hard negatives
+                    # Mine hard negatives within same disease only
                     neg_lnc_pool = neg_pairs_all[:, 0].to(self.device)
                     neg_dis_pool = neg_pairs_all[:, 1].to(self.device)
+                    
+                    # Build set of known positives for masking
+                    known_positives = set()
+                    for l, d in pos_pairs:
+                        known_positives.add((l.item(), d.item()))
                     
                     # Get unique diseases in this batch
                     unique_dis = torch.unique(pos_dis)
@@ -200,15 +205,25 @@ class HGATLDATrainer:
                     with torch.no_grad():
                         self.model.eval()  # Set to eval mode for hard negative mining
                         for d in unique_dis:
-                            # Find negatives for this disease
+                            # Find positives for this disease in batch
                             mask = pos_dis == d
                             if mask.sum() == 0:
                                 continue
                             
-                            # Get negative lncRNAs for this disease
+                            # Get negative lncRNAs for THIS SPECIFIC disease only
                             neg_mask = neg_dis_pool == d
                             if neg_mask.sum() > 0:
                                 neg_lncs_for_d = neg_lnc_pool[neg_mask]
+                                
+                                # Filter out any known positives
+                                valid_negs = []
+                                for lnc in neg_lncs_for_d:
+                                    if (lnc.item(), d.item()) not in known_positives:
+                                        valid_negs.append(lnc)
+                                
+                                if len(valid_negs) == 0:
+                                    continue
+                                neg_lncs_for_d = torch.stack(valid_negs)
                                 
                                 # Score all negative lncRNAs in batches to avoid BN issues
                                 if len(neg_lncs_for_d) > 1:

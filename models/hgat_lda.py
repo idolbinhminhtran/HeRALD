@@ -53,6 +53,12 @@ class HGAT_LDA(nn.Module):
         self.emb_dim = emb_dim
         self.num_layers = num_layers
         self.dropout = dropout
+        self.num_heads = num_heads
+        
+        # Assert emb_dim is divisible by num_heads
+        assert emb_dim % num_heads == 0, f"emb_dim ({emb_dim}) must be divisible by num_heads ({num_heads})"
+        head_dim = emb_dim // num_heads
+        print(f"  Model: emb_dim={emb_dim}, num_heads={num_heads}, head_dim={head_dim}")
         
         # Node embeddings with better initialization
         self.lnc_embed = nn.Embedding(num_lncRNAs, emb_dim)

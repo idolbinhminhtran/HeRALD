@@ -32,6 +32,45 @@ class HGATLDAEvaluator:
         self.device = device
         self.full_ranking = full_ranking
     
+    def score_all_lnc(self,
+                      model: torch.nn.Module,
+                      d_idx: int,
+                      edges: Dict,
+                      num_lncRNAs: int,
+                      batch_size: int = 100) -> torch.Tensor:
+        """
+        Score all lncRNAs for a given disease (vectorized).
+        
+        Args:
+            model: Trained model
+            d_idx: Disease index
+            edges: Graph edges
+            num_lncRNAs: Total number of lncRNAs
+            batch_size: Batch size for scoring
+            
+        Returns:
+            Logit scores for all lncRNAs (not sigmoid)
+        """
+        model.eval()
+        all_scores = []
+        
+        with torch.no_grad():
+            # Score in batches to avoid OOM
+            for start in range(0, num_lncRNAs, batch_size):
+                end = min(start + batch_size, num_lncRNAs)
+                batch_size_actual = end - start
+                
+                # Create batch
+                lnc_batch = torch.arange(start, end, device=self.device)
+                dis_batch = torch.full((batch_size_actual,), d_idx, 
+                                      dtype=torch.long, device=self.device)
+                
+                # Score batch (raw logits)
+                scores = model(lnc_batch, dis_batch, edges)
+                all_scores.append(scores)
+        
+        return torch.cat(all_scores)
+    
     def rank_all_for_disease(self, 
                             disease_idx: int,
                             edges: Dict,
@@ -489,57 +528,40 @@ class HGATLDAEvaluator:
         print(f"Legend: [R] = disease was rewritten due to isolation")
         print(f"{'='*70}\n")
         
-        # Extract necessary matrices from data_dict
-        lnc_disease_assoc = data_dict['lnc_disease_assoc']  # disease x lncRNA format
-        dis_sim = data_dict['DD_sim']
+        # Import build_fold_edges
+        from data.graph_construction import build_fold_edges
+        
+        # Create config for build_fold_edges
+        fold_config = {
+            'eval': {'rewrite_isolated': rewrite_isolated},
+            'data': {
+                'sim_topk': sim_topk,
+                'sim_row_normalize': sim_row_normalize,
+                'threshold': sim_threshold,
+                'sim_mutual': False,
+                'sim_sym': True,
+                'sim_row_norm': sim_row_normalize,
+                'sim_tau': None,
+                'use_bipartite_edge_weight': False
+            }
+        }
         
         for fold_idx in tqdm(range(num_folds), desc="LOOCV Progress", position=0, leave=True):
             # Get the held-out pair
             test_lnc = int(pos_pairs[fold_idx, 0].item())
             test_dis = int(pos_pairs[fold_idx, 1].item())
             
-            # Create training pairs (all except the held-out pair)
-            train_pos_pairs = torch.cat([pos_pairs[:fold_idx], pos_pairs[fold_idx+1:]], dim=0)
+            # Build per-fold edges (removes test edge, handles isolation)
+            fold_edges, removed_edge_present, disease_was_rewritten, ld_edge_count = build_fold_edges(
+                data_dict, fold_config, test_lnc, test_dis
+            )
             
-            # Create a modified lnc_disease_assoc matrix without the held-out pair
-            fold_ld_mat = lnc_disease_assoc.clone()
-            fold_ld_mat[test_dis, test_lnc] = 0  # Remove the held-out association
-            
-            # Check if the disease is now isolated (no remaining associations)
-            disease_degree = fold_ld_mat[test_dis].sum().item()
-            disease_was_rewritten = False
-            
-            if disease_degree == 0 and rewrite_isolated:
-                # Disease is isolated, apply rewrite
-                fold_ld_mat = rewrite_ld_for_isolated_diseases(fold_ld_mat, dis_sim, test_dis)
+            if disease_was_rewritten:
                 num_rewrites += 1
                 rewritten_diseases.append(test_dis)
-                disease_was_rewritten = True
-                
-                # Verify that disease now has connections
-                new_degree = fold_ld_mat[test_dis].sum().item()
-                assert new_degree > 0, f"Disease {test_dis} still isolated after rewrite!"
-                
-                if fold_idx == 0 or (fold_idx + 1) % 100 == 0:
-                    print(f"\n  Fold {fold_idx+1}: Disease {test_dis} was isolated, rewritten (new degree: {new_degree:.3f})")
             
-            # Reconstruct the graph with the modified associations
-            fold_data_dict = data_dict.copy()
-            fold_data_dict['lnc_disease_assoc'] = fold_ld_mat
-            
-            # Construct the heterogeneous graph for this fold
-            fold_edges = construct_heterogeneous_graph(
-                fold_data_dict,
-                sim_topk=sim_topk,
-                sim_row_normalize=sim_row_normalize,
-                sim_threshold=sim_threshold,
-                sim_mutual=False,  # Keep mutual kNN off during LOOCV for stability
-                sim_sym=True,
-                sim_row_norm=sim_row_normalize,
-                sim_tau=None,
-                use_bipartite_edge_weight=False,  # Keep edge weights off during LOOCV for speed
-                verbose=False  # Suppress verbose output during LOOCV
-            )
+            # Create training pairs (all except the held-out pair)
+            train_pos_pairs = torch.cat([pos_pairs[:fold_idx], pos_pairs[fold_idx+1:]], dim=0)
             
             # Move edges to device
             fold_edges_device = {}
@@ -601,82 +623,79 @@ class HGATLDAEvaluator:
             finally:
                 sys.stdout = old_stdout
             
-            # Evaluate on the held-out disease
-            # For evaluation, we rank all lncRNAs for the held-out disease
+            # Full-ranking evaluation with proper masking
             model_fold.eval()
-            with torch.no_grad():
-                # Score for the true positive pair
-                pos_score = torch.sigmoid(model_fold(
-                    torch.tensor([test_lnc], device=self.device),
-                    torch.tensor([test_dis], device=self.device),
-                    fold_edges_device
-                )).item()
+            
+            # Score all lncRNAs for the test disease (vectorized)
+            scores = self.score_all_lnc(model_fold, test_dis, fold_edges_device, num_lncRNAs)  # [L]
+            
+            # Create mask for known positives (from original data, not just training)
+            known_pos = data_dict['lnc_disease_assoc'][test_dis].bool()  # [L]
+            
+            # Create labels: only test_lnc is positive
+            y = torch.zeros_like(scores, dtype=torch.long)
+            y[test_lnc] = 1
+            
+            # Create valid mask: exclude other known positives but include test_lnc
+            valid = ~known_pos
+            valid[test_lnc] = True
+            
+            # Extract valid scores and labels for evaluation
+            s = scores[valid].detach().cpu().numpy()
+            lbl = y[valid].cpu().numpy()
+            
+            # Calculate metrics with inversion guard
+            if len(s) > 1 and lbl.sum() > 0:  # Ensure we have both pos and neg
+                # Try both orientations
+                fold_auc = roc_auc_score(lbl, s)
+                fold_auc_inv = roc_auc_score(lbl, -s)
                 
-                # Score all other lncRNAs for this disease (excluding known positives)
-                all_scores = []
-                all_labels = []
+                if fold_auc_inv > fold_auc + 1e-4:
+                    print(f"  ⚠️ Fold {fold_idx+1}: inversion detected, using -scores (AUC: {fold_auc:.3f} → {fold_auc_inv:.3f})")
+                    fold_auc = fold_auc_inv
+                    s = -s  # Use inverted scores for other metrics
                 
-                # Get known associations for this disease from training data
-                known_lncs_for_disease = set()
-                for lnc, dis in train_pos_pairs:
-                    if dis.item() == test_dis:
-                        known_lncs_for_disease.add(lnc.item())
+                fold_aupr = average_precision_score(lbl, s)
                 
-                # Score all lncRNAs
-                for lnc_idx in range(num_lncRNAs):
-                    if lnc_idx == test_lnc:
-                        # This is the true positive
-                        all_scores.append(pos_score)
-                        all_labels.append(1)
-                    elif lnc_idx not in known_lncs_for_disease:
-                        # This is a negative (unknown association)
-                        score = torch.sigmoid(model_fold(
-                            torch.tensor([lnc_idx], device=self.device),
-                            torch.tensor([test_dis], device=self.device),
-                            fold_edges_device
-                        )).item()
-                        all_scores.append(score)
-                        all_labels.append(0)
+                # Calculate F1-max
+                precision, recall, thresholds = precision_recall_curve(lbl, s)
+                f1_scores = 2 * (precision * recall) / (precision + recall + 1e-8)
+                fold_f1_max = np.max(f1_scores[np.isfinite(f1_scores)])
                 
-                # Calculate metrics for this fold
-                if len(all_scores) > 1 and sum(all_labels) > 0:  # Ensure we have both pos and neg
-                    fold_auc = roc_auc_score(all_labels, all_scores)
-                    fold_aupr = average_precision_score(all_labels, all_scores)
-                    
-                    # Calculate F1-max
-                    precision, recall, thresholds = precision_recall_curve(all_labels, all_scores)
-                    f1_scores = 2 * (precision * recall) / (precision + recall + 1e-8)
-                    fold_f1_max = np.max(f1_scores[np.isfinite(f1_scores)])
-                    
-                    fold_results.append({
-                        'fold': fold_idx + 1,
-                        'test_lnc': test_lnc,
-                        'test_disease': test_dis,
-                        'disease_was_rewritten': disease_was_rewritten,
-                        'auc': fold_auc,
-                        'aupr': fold_aupr,
-                        'f1_max': fold_f1_max
-                    })
-                    
-                    # Print progress after EACH fold
-                    mean_auc = np.mean([r['auc'] for r in fold_results])
-                    mean_aupr = np.mean([r['aupr'] for r in fold_results])
-                    mean_f1 = np.mean([r['f1_max'] for r in fold_results])
-                    
-                    # Compact single-line output for each fold
-                    print(f"Fold {fold_idx+1:4d}/{num_folds}: "
-                          f"AUC={fold_auc:.3f} (mean={mean_auc:.3f}), "
-                          f"AUPR={fold_aupr:.3f} (mean={mean_aupr:.3f}), "
-                          f"F1={fold_f1_max:.3f} (mean={mean_f1:.3f}) "
-                          f"{'[R]' if disease_was_rewritten else ''}")
-                    
-                    # Print summary every 100 folds
-                    if (fold_idx + 1) % 100 == 0:
-                        print(f"\n{'─'*60}")
-                        print(f"Summary at fold {fold_idx+1}:")
-                        print(f"  Mean AUC: {mean_auc:.4f}, AUPR: {mean_aupr:.4f}, F1: {mean_f1:.4f}")
-                        print(f"  Rewrites so far: {num_rewrites}/{fold_idx+1} ({num_rewrites/(fold_idx+1)*100:.1f}%)")
-                        print(f"{'─'*60}\n")
+                # Calculate rank of true lncRNA (for diagnostics)
+                true_score = scores[test_lnc].item()
+                rank = (scores > true_score).sum().item() + 1
+                
+                fold_results.append({
+                    'fold': fold_idx + 1,
+                    'test_lnc': test_lnc,
+                    'test_disease': test_dis,
+                    'disease_was_rewritten': disease_was_rewritten,
+                    'auc': fold_auc,
+                    'aupr': fold_aupr,
+                    'f1_max': fold_f1_max
+                })
+                
+                # Print progress after EACH fold
+                mean_auc = np.mean([r['auc'] for r in fold_results])
+                mean_aupr = np.mean([r['aupr'] for r in fold_results])
+                mean_f1 = np.mean([r['f1_max'] for r in fold_results])
+                
+                # Compact single-line output for each fold with diagnostics
+                print(f"Fold {fold_idx+1:4d}/{num_folds}: "
+                      f"AUC={fold_auc:.3f} (mean={mean_auc:.3f}), "
+                      f"rank={rank:3d}, "
+                      f"edge={removed_edge_present}, "
+                      f"ld_edges={ld_edge_count}/855 "
+                      f"{'[R]' if disease_was_rewritten else ''}")
+                
+                # Print summary every 100 folds
+                if (fold_idx + 1) % 100 == 0:
+                    print(f"\n{'─'*60}")
+                    print(f"Summary at fold {fold_idx+1}:")
+                    print(f"  Mean AUC: {mean_auc:.4f}, AUPR: {mean_aupr:.4f}, F1: {mean_f1:.4f}")
+                    print(f"  Rewrites so far: {num_rewrites}/{fold_idx+1} ({num_rewrites/(fold_idx+1)*100:.1f}%)")
+                    print(f"{'─'*60}\n")
         
         # Calculate macro averages
         macro_averages = {

@@ -198,9 +198,20 @@ def run_evaluation(config: Dict[str, Any], dataset_info: Dict, edges: Dict, pos_
             print(f"   {key}: {value}")
 
 
-def run_loocv(config: Dict[str, Any], dataset_info: Dict, edges: Dict, pos_pairs: torch.Tensor, device: torch.device, results_path: str, data_dict: Dict[str, torch.Tensor]):
+def run_loocv(config: Dict[str, Any], dataset_info: Dict, edges: Dict, pos_pairs: torch.Tensor, device: torch.device, results_path: str, data_dict: Dict[str, torch.Tensor], 
+              fold_limit: int = None, smoke: bool = False):
     """Run LOOCV mode with disease rewrite support."""
     print("\n🔄 Starting LOOCV...")
+    
+    # Handle smoke mode
+    if smoke:
+        fold_limit = 5
+        print("🚨 SMOKE MODE: Running first 5 folds with diagnostics")
+    
+    # Apply fold limit if specified
+    if fold_limit is not None:
+        pos_pairs = pos_pairs[:fold_limit]
+        print(f"📊 Limited to {fold_limit} folds")
     
     # Check evaluation protocol
     eval_protocol = config.get('eval', {}).get('protocol', 'loocv_pair')
@@ -376,6 +387,12 @@ def main():
                        help='Device to use (auto/cuda/cpu)')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
+    parser.add_argument('--fold_limit', type=int, default=None,
+                       help='Limit number of LOOCV folds (for smoke testing)')
+    parser.add_argument('--smoke', action='store_true',
+                       help='Run in smoke mode (first 5 folds with diagnostics)')
+    parser.add_argument('--sim_topk', type=int, default=None,
+                       help='Override sim_topk for testing')
     args = parser.parse_args()
     
     # Set seed
@@ -391,6 +408,11 @@ def main():
     # Load configuration
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
+    
+    # Override sim_topk if specified
+    if args.sim_topk is not None:
+        config['data']['sim_topk'] = args.sim_topk
+        print(f"📊 Overriding sim_topk to {args.sim_topk}")
     
     # Create results directory
     results_dir = Path(args.results_path)
@@ -420,7 +442,8 @@ def main():
         run_evaluation(config, dataset_info, edges_device, pos_pairs, device, args.results_path, args.model_path)
         
     elif args.mode == 'loocv':
-        run_loocv(config, dataset_info, edges_device, pos_pairs, device, args.results_path, data_dict)
+        run_loocv(config, dataset_info, edges_device, pos_pairs, device, args.results_path, data_dict,
+                  fold_limit=args.fold_limit, smoke=args.smoke)
         
     else:
         print(f"❌ Unknown mode: {args.mode}")
